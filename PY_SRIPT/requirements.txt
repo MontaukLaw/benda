@@ -1,0 +1,5 @@
+pyqtgraph
+pyserial
+PySide6
+python-can[gs-usb]==4.6.1
+libusb-package; sys_platform == "win32"

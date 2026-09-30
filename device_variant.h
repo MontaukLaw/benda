@@ -1,0 +1,73 @@
+/* 防止设备变体配置头文件被重复包含。 */
+#ifndef DEVICE_VARIANT_H
+/* 定义设备变体配置头文件包含保护宏。 */
+#define DEVICE_VARIANT_H
+
+/* 定义食指固件的编译期类型值。 */
+#define DEVICE_FINGER_TYPE_INDEX_FINGER (1u)
+/* 定义拇指固件的编译期类型值。 */
+#define DEVICE_FINGER_TYPE_THUMB (2u)
+/* 定义小指固件的编译期类型值。 */
+#define DEVICE_FINGER_TYPE_PINKY (3u)
+
+/* 未由构建命令指定类型时保持兼容，默认生成食指固件。 */
+#ifndef DEVICE_FINGER_TYPE
+#define DEVICE_FINGER_TYPE DEVICE_FINGER_TYPE_THUMB // DEVICE_FINGER_TYPE_INDEX_FINGER
+#endif
+
+/* 根据手指类型集中选择设备名、通道数、时基和硬件能力。 */
+#if (DEVICE_FINGER_TYPE == DEVICE_FINGER_TYPE_INDEX_FINGER)
+#define DEVICE_FINGER_NAME "INDEX_FINGER"
+/* 食指构建现为4TX乘5RX独立矩阵，全部20点接入同一算法链路。 */
+#define DEVICE_MATRIX20 (1u)
+#define DEVICE_SENSOR_CHANNEL_COUNT (20u)
+#define DEVICE_ALGORITHM_FRAME_RATE_HZ (200u)
+/* 矩阵启动直接使用Configurator参数，不再覆盖生成配置。 */
+#define DEVICE_ENFORCE_FIXED_CAPSENSE_CONFIG (0u)
+#define DEVICE_FIXED_CAPSENSE_NSUB (300u)
+#define DEVICE_FIXED_CAPSENSE_TX_DIVIDER (100u)
+/* 保留固定配置接口的备用值，与当前Configurator的RefCDAC一致。 */
+#define DEVICE_FIXED_CAPSENSE_REF_CDAC (12u)
+#define DEVICE_HAS_MATRIX_AUTORANGE (0u)
+#elif (DEVICE_FINGER_TYPE == DEVICE_FINGER_TYPE_THUMB)
+#define DEVICE_FINGER_NAME "THUMB"
+#define DEVICE_SENSOR_CHANNEL_COUNT (5u)
+#define DEVICE_ALGORITHM_FRAME_RATE_HZ (250u)
+#define DEVICE_ENFORCE_FIXED_CAPSENSE_CONFIG (0u)
+#define DEVICE_HAS_MATRIX_AUTORANGE (0u)
+#elif (DEVICE_FINGER_TYPE == DEVICE_FINGER_TYPE_PINKY)
+#define DEVICE_FINGER_NAME "PINKY"
+#define DEVICE_SENSOR_CHANNEL_COUNT (5u)
+#define DEVICE_ALGORITHM_FRAME_RATE_HZ (250u)
+#define DEVICE_ENFORCE_FIXED_CAPSENSE_CONFIG (0u)
+#define DEVICE_HAS_MATRIX_AUTORANGE (0u)
+#else
+#error "DEVICE_FINGER_TYPE must be INDEX_FINGER(1), THUMB(2), or PINKY(3)"
+#endif
+
+/* 旧五通道变体仍保留原有功能，矩阵不计算四通道合力。 */
+#ifndef DEVICE_MATRIX20
+#define DEVICE_MATRIX20 (0u)
+#endif
+#define DEVICE_HAS_FORCE_OUTPUT (!DEVICE_MATRIX20)
+
+/* 设备信息能力位0表示支持CH4至CH7矩阵自动量程。 */
+#define DEVICE_CAPABILITY_MATRIX_AUTORANGE (1u << 0u)
+/* 设备信息能力位1表示支持易失性全通道三参数手动配置。 */
+#define DEVICE_CAPABILITY_RUNTIME_CAPSENSE_CONFIG (1u << 1u)
+/* 三种手指固件均允许在运行时统一修改全部通道的三参数。 */
+#define DEVICE_HAS_RUNTIME_CAPSENSE_CONFIG (1u)
+
+/* 当前固定档位固件全面停用仿射加载、应用、暂存和Flash保存。 */
+#define DEVICE_HAS_AFFINE_CALIBRATION (0u)
+
+/* 根据硬件能力生成设备信息帧中的能力位图。 */
+#if DEVICE_HAS_MATRIX_AUTORANGE
+#define DEVICE_CAPABILITY_FLAGS \
+	(DEVICE_CAPABILITY_MATRIX_AUTORANGE | DEVICE_CAPABILITY_RUNTIME_CAPSENSE_CONFIG)
+#else
+#define DEVICE_CAPABILITY_FLAGS DEVICE_CAPABILITY_RUNTIME_CAPSENSE_CONFIG
+#endif
+
+/* 结束设备变体配置头文件包含保护。 */
+#endif
