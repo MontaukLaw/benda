@@ -71,6 +71,8 @@
 /* Type 0x03按0.1摄氏度单位上传芯片内部温度。 */
 #define SENSOR_ALGO_FRAME_TYPE_TEMPERATURE (0x03u)
 #define SENSOR_ALGO_FRAME_TYPE_DEBUG (0x10u)
+/* 独立Raw帧只包含逐通道小端uint16，避免与Signal或完整Debug帧混淆。 */
+#define SENSOR_ALGO_FRAME_TYPE_RAW (0x16u)
 /* 固定四通道统计使用独立帧，不改变已有信号帧和调试帧布局。 */
 #define SENSOR_ALGO_FRAME_TYPE_CHANNEL_4567_STATISTICS (0x14u)
 #define SENSOR_ALGO_FRAME_TYPE_FORCE_VECTOR (0x11u)
@@ -317,11 +319,13 @@ typedef struct {
 static uint32_t baseline_q16[SENSOR_ALGO_CHANNEL_COUNT];
 static uint32_t signal_q16[SENSOR_ALGO_CHANNEL_COUNT];
 /* 保存每个通道进入 ACTIVE_FLOATING 时锁定的 Q16 Signal。 */
+#if DEVICE_HAS_FLOATING_LOCK
 static uint32_t floating_locked_signal_q16[SENSOR_ALGO_CHANNEL_COUNT];
 /* 保存每个通道已经吸收的活动期蠕变补偿量，单位为 Signal count。 */
 static int32_t floating_compensation_values[SENSOR_ALGO_CHANNEL_COUNT];
 /* 标记每个通道当前是否保留有效的蠕变补偿。 */
 static bool floating_compensation_valid[SENSOR_ALGO_CHANNEL_COUNT];
+#endif
 /* 保存每个通道快速重复按压前尚未恢复的临时零点偏移，单位为 count。 */
 static uint16_t cycle_zero_offset_values[SENSOR_ALGO_CHANNEL_COUNT];
 /* 矩阵仅保留状态机的快慢K历史，停用重复的旧版漂移缓冲以节省RAM。 */
@@ -455,6 +459,8 @@ static void update_channel_drift(uint32_t index, uint16_t raw, uint16_t signal, 
 static int32_t calculate_drift_k_q16(uint64_t sum, uint64_t weighted_sum);
 static void send_signal_frame(const sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT]);
 static void send_debug_frame(const sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT]);
+/* Baseline关闭时复用现有长度帧头和发送队列上传原始计数。 */
+static void send_raw_frame(const sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT]);
 /* 上报同一扫描的四通道硬件原始值统计及信号和。 */
 #if SENSOR_ALGO_CHANNEL_COUNT >= 8u
 static void send_channel_4567_statistics_frame(const sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT]);
@@ -637,7 +643,12 @@ void SensorAlgorithm_GetLatestSnapshot(sensor_algorithm_snapshot_t *snapshot) {
 }
 
 /* 手动重新校准只重建基线，统一固定噪声策略持续生效。 */
-void SensorAlgorithm_RequestRecalibration(void) { begin_calibration(); }
+void SensorAlgorithm_RequestRecalibration(void) {
+/* Raw观察模式不启动基线校准，也不暂停采样上传。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
+	begin_calibration();
+#endif
+}
 
 void SensorAlgorithm_RestartBaselineInitialization(void) { initialize_baseline_runtime(); }
 
@@ -1357,6 +1368,8 @@ int32_t count_normal_k_x10000(uint16_t signal, int32_t signal_k_q16) {
 void SensorAlgorithm_Process(const uint16_t raw_values[SENSOR_ALGO_CHANNEL_COUNT], sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT]) {
 	uint32_t index;
 
+/* 关闭Baseline时跳过基线跟踪、Signal滤波和依赖它们的状态判定。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
 /* 仅旧手指产品使用力组接触提示，矩阵各通道独立处理。 */
 #if DEVICE_HAS_FORCE_OUTPUT
 	update_force_vector_group_contact_hint(raw_values);
@@ -1385,6 +1398,16 @@ void SensorAlgorithm_Process(const uint16_t raw_values[SENSOR_ALGO_CHANNEL_COUNT
 		/* 快照直接保存真实状态，和本帧基线执行策略一致。 */
 		latest_snapshot.states[index] = ChannelState_Get(&channel_state_machines[index]);
 	}
+#else
+	memset(outputs, 0, sizeof(sensor_algorithm_output_t) * SENSOR_ALGO_CHANNEL_COUNT);
+	for (index = 0u; index < SENSOR_ALGO_CHANNEL_COUNT; index++) {
+		outputs[index].raw = raw_values[index];
+		outputs[index].noise = SENSOR_ALGO_FIXED_NOISE;
+		latest_snapshot.channels[index] = outputs[index];
+		/* 快照仍消费唯一状态机，不建立或伪造新的通道状态。 */
+		latest_snapshot.states[index] = ChannelState_Get(&channel_state_machines[index]);
+	}
+#endif
 }
 
 static void process_sensor_frame(const uint16_t raw_values[SENSOR_ALGO_CHANNEL_COUNT], sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT]) {
@@ -1393,7 +1416,7 @@ static void process_sensor_frame(const uint16_t raw_values[SENSOR_ALGO_CHANNEL_C
 	SensorAlgorithm_Process(raw_values, outputs);
 
 	/* 仅在启用力矢量输出功能时编译下面的力矢量处理代码。 */
-#if SENSOR_ALGO_FORCE_VECTOR_OUTPUT
+#if SENSOR_ALGO_FORCE_VECTOR_OUTPUT && SENSOR_ALGO_BASELINE_ENABLED
 
 	/* 根据本轮通道输出更新指尖和指腹的力矢量计算结果。 */
 	update_force_vector(outputs);
@@ -1406,6 +1429,10 @@ static void process_sensor_frame(const uint16_t raw_values[SENSOR_ALGO_CHANNEL_C
 }
 
 static void send_sensor_frame(const sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT]) {
+/* Raw观察模式下所有输出模式统一发送Raw，不等待基线校准或上传压力值。 */
+#if !SENSOR_ALGO_BASELINE_ENABLED
+	send_raw_frame(outputs);
+#else
 /* 矩阵使用V21长度帧发送各通道数据，不发送四通道统计或合力。 */
 #if DEVICE_MATRIX20
 	if (startup_quiet_frame_count < SENSOR_ALGO_STARTUP_QUIET_FRAMES) {
@@ -1481,6 +1508,7 @@ static void send_sensor_frame(const sensor_algorithm_output_t outputs[SENSOR_ALG
 		send_capsense_autorange_status_frame(false);
 	}
 #endif
+#endif
 }
 
 int _write(int file, char *ptr, int len) {
@@ -1503,9 +1531,11 @@ void SensorAlgorithm_ProcessAndSend(
 	const uint16_t raw_values[SENSOR_ALGO_CHANNEL_COUNT]) {
 	/* 保存本轮所有传感器通道的算法输出。 */
 	sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT];
+	uint32_t channel_index;
+/* Raw观察模式不执行依赖基线的量程过渡隔离逻辑。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
 	/* 保存当前自动量程状态，用于隔离切档合成轨迹和通道状态机。 */
 	capsense_autorange_status_t autorange_status;
-	uint32_t channel_index;
 
 	/* 读取过渡剩余帧数，识别本帧是否仍在切档以及是否刚结束切档。 */
 	CapSenseAutoRange_GetStatus(&autorange_status);
@@ -1515,6 +1545,7 @@ void SensorAlgorithm_ProcessAndSend(
 
 	/* 保存本帧过渡状态，供下一帧检测结束边沿。 */
 	autorange_transition_was_active = autorange_transition_active;
+#endif
 
 	/* 缓存同一扫描的硬件Raw，用于诊断帧和原始值统计。 */
 	for (channel_index = 0u; channel_index < SENSOR_ALGO_CHANNEL_COUNT; channel_index++) {
@@ -1763,11 +1794,13 @@ static uint16_t update_channel_signal(uint32_t index, uint32_t positive_diff, ui
 	/* 先扣除快速重复按压前记录的材料残余偏移，永久 Baseline 保持不变。 */
 	compensated_target = (int64_t)positive_diff - (int64_t)cycle_zero_offset_values[index];
 	/* 已经建立蠕变补偿时，再扣除稳定按压期间累计吸收的蠕变量。 */
+#if DEVICE_HAS_FLOATING_LOCK
 	if (floating_compensation_valid[index]) {
 		/* 使用有符号运算兼容退出 FLOATING 时可能保留的负向补偿。 */
 		compensated_target -= floating_compensation_values[index];
 	/* 结束活动期蠕变补偿处理。 */
 	}
+#endif
 	/* 补偿后的目标低于零时钳制为零。 */
 	if (compensated_target < 0) {
 		/* 防止负值转换为无符号数后产生异常大 Signal。 */
@@ -2009,17 +2042,20 @@ static void update_output_state(uint32_t index, uint16_t raw, uint32_t positive_
 
 	/* SLOW_BACK 和 ZERO_REBASE 期间都不允许残余 Signal 对外输出。 */
 	if ((state == SENSOR_ALGO_STATE_SLOW_BACK) || (state == SENSOR_ALGO_STATE_ZERO_REBASE)) {
+#if DEVICE_HAS_FLOATING_LOCK
 		/* 恢复阶段不再保留上一轮稳定按压建立的蠕变补偿。 */
 		floating_compensation_valid[index] = false;
 		/* 清零补偿值，避免调试时看到已经失效的历史数据。 */
 		floating_compensation_values[index] = 0;
 		/* 清零锁定值，等待下一轮稳定按压重新建立。 */
 		floating_locked_signal_q16[index] = 0u;
+#endif
 		/* 清零内部 Q16 Signal，避免离开 SLOW_BACK 时带出历史残值。 */
 		signal_q16[index] = 0u;
 		/* 将本帧返回给采样处理流程的 Signal 清零。 */
 		*signal = 0u;
-	/* 当前状态进入或保持 ACTIVE_FLOATING 时锁定输出并更新蠕变补偿。 */
+	/* 只有支持锁定的旧变体才编译固定Signal输出分支。 */
+#if DEVICE_HAS_FLOATING_LOCK
 	} else if (state == SENSOR_ALGO_STATE_ACTIVE_FLOATING) {
 		/* 刚进入锁定状态时保存经过滤波的当前 Signal。 */
 		if (previous_state != SENSOR_ALGO_STATE_ACTIVE_FLOATING) {
@@ -2035,14 +2071,17 @@ static void update_output_state(uint32_t index, uint16_t raw, uint32_t positive_
 		signal_q16[index] = floating_locked_signal_q16[index];
 		/* 将本帧对外 Signal 同步覆盖为锁定值。 */
 		*signal = q16_to_u16(floating_locked_signal_q16[index]);
+#endif
 	/* 返回空闲、等待或恢复阶段时结束本轮活动期蠕变补偿。 */
 	} else if (ChannelState_IsIdleLike(state)) {
+#if DEVICE_HAS_FLOATING_LOCK
 		/* 清除有效标记，使下一轮按压使用未经补偿的正常 Signal。 */
 		floating_compensation_valid[index] = false;
 		/* 清零活动期补偿值。 */
 		floating_compensation_values[index] = 0;
 		/* 清零上一轮保存的锁定 Signal。 */
 		floating_locked_signal_q16[index] = 0u;
+#endif
 		/* 完全回到空闲后清除快速重复按压使用的本轮临时零点。 */
 		cycle_zero_offset_values[index] = 0u;
 		/* 清零内部滤波 Signal，防止 SLOW_BACK 退出时残余 Raw-Baseline 差值重新泄漏。 */
@@ -2206,12 +2245,14 @@ static void reset_channel_runtime_state(uint32_t index, bool reset_signal) {
 		signal_q16[index] = 0u;
 	}
 
+#if DEVICE_HAS_FLOATING_LOCK
 	/* 复位通道时清除稳定按压阶段保存的 Signal 锁定值。 */
 	floating_locked_signal_q16[index] = 0u;
 	/* 复位通道时清除活动期蠕变补偿。 */
 	floating_compensation_values[index] = 0;
 	/* 复位通道时将蠕变补偿标记为无效。 */
 	floating_compensation_valid[index] = false;
+#endif
 
 	idle_counts[index] = 0u;
 	active_recal_counts[index] = 0u;
@@ -2287,12 +2328,14 @@ static void begin_channel_recalibration(uint32_t index) {
 	release_recovery_stable_counts[index] = 0u;
 	channel_was_active[index] = false;
 	signal_q16[index] = 0u;
+#if DEVICE_HAS_FLOATING_LOCK
 	/* 开始通道重校准时清除活动期Signal锁定值。 */
 	floating_locked_signal_q16[index] = 0u;
 	/* 开始通道重校准时清除蠕变补偿值。 */
 	floating_compensation_values[index] = 0;
 	/* 开始通道重校准时使蠕变补偿失效。 */
 	floating_compensation_valid[index] = false;
+#endif
 	previous_positive_diff_values[index] = 0u;
 	previous_raw_values[index] = 0u;
 	active_peak_diff_values[index] = 0u;
@@ -2589,6 +2632,19 @@ static void update_channel_drift(uint32_t index, uint16_t raw, uint16_t signal, 
 #endif
 
 #endif
+}
+
+/* Type 0x16仅上传真实硬件Raw；Baseline、Signal及未计算的诊断字段由接收端补齐。 */
+static void send_raw_frame(const sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT]) {
+	uint32_t sensor_index;
+	uint32_t offset = 0u;
+	uint8_t frame[SENSOR_ALGO_SIGNAL_FRAME_SIZE];
+
+	write_frame_header(frame, &offset, SENSOR_ALGO_FRAME_TYPE_RAW, SENSOR_ALGO_CHANNEL_COUNT, SENSOR_ALGO_SIGNAL_PAYLOAD_SIZE);
+	for (sensor_index = 0u; sensor_index < SENSOR_ALGO_CHANNEL_COUNT; sensor_index++) {
+		write_u16(frame, &offset, outputs[sensor_index].raw);
+	}
+	send_output_frame(frame, sizeof(frame));
 }
 
 static void send_signal_frame(const sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT]) {
@@ -2928,12 +2984,14 @@ static void reset_force_group_recovery(force_group_recovery_t *recovery) {
 
 static void clear_channel_signal_output(sensor_algorithm_output_t outputs[SENSOR_ALGO_CHANNEL_COUNT], uint32_t channel_index) {
 	signal_q16[channel_index] = 0u;
+#if DEVICE_HAS_FLOATING_LOCK
 	/* 强制清除通道输出时同步清除FLOATING锁定值。 */
 	floating_locked_signal_q16[channel_index] = 0u;
 	/* 强制清除通道输出时同步清除蠕变补偿值。 */
 	floating_compensation_values[channel_index] = 0;
 	/* 强制清除通道输出时同步使蠕变补偿失效。 */
 	floating_compensation_valid[channel_index] = false;
+#endif
 	idle_counts[channel_index] = 0u;
 	active_recal_counts[channel_index] = 0u;
 	post_active_baseline_delay_counts[channel_index] = 0u;
@@ -3003,12 +3061,14 @@ static void suppress_force_group_outputs(force_vector_context_t *context, sensor
 		uint32_t channel_index = ch_idx[index];
 
 		signal_q16[channel_index] = 0u;
+#if DEVICE_HAS_FLOATING_LOCK
 		/* 力组抑制通道输出时同步清除FLOATING锁定值。 */
 		floating_locked_signal_q16[channel_index] = 0u;
 		/* 力组抑制通道输出时同步清除蠕变补偿值。 */
 		floating_compensation_values[channel_index] = 0;
 		/* 力组抑制通道输出时同步使蠕变补偿失效。 */
 		floating_compensation_valid[channel_index] = false;
+#endif
 		release_counts[channel_index] = 0u;
 		fast_release_counts[channel_index] = 0u;
 		fast_release_latched[channel_index] = false;
@@ -3229,12 +3289,14 @@ static void update_force_group_recovery(force_group_recovery_t *recovery, force_
 				recovery->min_delta[index] = fminf(raw - origin, 0.0f);
 				recovery->previous_raw[index] = raw;
 				signal_q16[channel_index] = 0u;
+#if DEVICE_HAS_FLOATING_LOCK
 				/* 力组重新接触时清除上一轮FLOATING锁定值。 */
 				floating_locked_signal_q16[channel_index] = 0u;
 				/* 力组重新接触时清除上一轮蠕变补偿值。 */
 				floating_compensation_values[channel_index] = 0;
 				/* 力组重新接触时使上一轮蠕变补偿失效。 */
 				floating_compensation_valid[channel_index] = false;
+#endif
 				release_recovery_counts[channel_index] = 0u;
 				release_recovery_stable_counts[channel_index] = 0u;
 				post_release_gate_values[channel_index] = 0u;

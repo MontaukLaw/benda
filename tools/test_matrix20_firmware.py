@@ -78,7 +78,7 @@ class Matrix20FirmwareTests(unittest.TestCase):
                 for _ in range(3*hz): fw.sample([8000]*20)
                 # 大部分卸载过程斜率低于快速松手阈值，仍应在稳定后释放残余。
                 for _ in range(6*hz): states, outputs = fw.sample([8500]*20)
-                self.assertEqual(states,(6,)*20)
+                self.assertEqual(states,(2,)*20)
                 for i in range(10*hz): fw.sample([8500-round(400*(i+1)/(10*hz))]*20)
                 for _ in range(5*hz): states, outputs = fw.sample([8100]*20)
                 self.assertEqual(states,(0,)*20)
@@ -100,7 +100,7 @@ class Matrix20FirmwareTests(unittest.TestCase):
                 for _ in range(3*hz): fw.sample([8500]*20)
                 for _ in range(hz//5): fw.sample([7800]*20)
                 for _ in range(hz//2): states, outputs = fw.sample([8600]*20)
-                self.assertTrue(all(state in (1,2,3,6) for state in states))
+                self.assertTrue(all(state in (1,2,3) for state in states))
                 self.assertTrue(all(o[2]>100 for o in outputs))
 
     def test_matrix_release_thresholds_preserve_hold_and_reject_negative_rebound(self):
@@ -120,9 +120,9 @@ class Matrix20FirmwareTests(unittest.TestCase):
                 fw.call('SensorAlgorithm_RequestRecalibration')
                 for _ in range(3*hz): fw.sample([8000]*20)
                 for _ in range(5*hz): states, outputs = fw.sample([8060]*20)
-                self.assertEqual(states,(6,)*20)
+                self.assertEqual(states,(2,)*20)
                 for _ in range(5*hz): states, outputs = fw.sample([8050]*20)
-                self.assertTrue(all(s in (1,2,3,6) for s in states))
+                self.assertTrue(all(s in (1,2,3) for s in states))
                 self.assertTrue(all(o[2]>32 for o in outputs))
                 # 释放后只剩20 counts偏移，应完成正常恢复并把Signal归零。
                 for _ in range(5*hz): states, outputs = fw.sample([8020]*20)
@@ -131,7 +131,7 @@ class Matrix20FirmwareTests(unittest.TestCase):
                 # 200 counts按压部分卸载至150仍为接触，回落至80才满足新松手比例。
                 for _ in range(5*hz): fw.sample([8220]*20)
                 for _ in range(3*hz): states, outputs = fw.sample([8170]*20)
-                self.assertTrue(all(s in (1,2,3,6) for s in states))
+                self.assertTrue(all(s in (1,2,3) for s in states))
                 for _ in range(hz): states, outputs = fw.sample([8100]*20)
                 self.assertTrue(all(s in (4,5,7,8,0) for s in states))
                 self.assertTrue(all(o[2]==0 for o in outputs))
@@ -142,7 +142,7 @@ class Matrix20FirmwareTests(unittest.TestCase):
                 for _ in range(2*hz): fw.sample([8180]*20)
                 for i in range(3*hz):
                     states, outputs = fw.sample([8180-round(60*(i+1)/(3*hz))]*20)
-                    self.assertTrue(all(s in (1,2,3,6) for s in states))
+                    self.assertTrue(all(s in (1,2,3) for s in states))
 
     def test_twenty_independent_baselines_press_hold_release_and_recalibration(self):
         for hz in (200, 120):
@@ -163,7 +163,7 @@ class Matrix20FirmwareTests(unittest.TestCase):
                     fw.sample(values)
                 for _ in range(6*hz):
                     states, outputs = fw.sample(values)
-                self.assertEqual(states, tuple(6 if i % 2 == 0 else 0 for i in range(20)))
+                self.assertEqual(states, tuple(2 if i % 2 == 0 else 0 for i in range(20)))
                 self.assertEqual([o[1] for o in outputs], base)
                 self.assertTrue(all(o[2] > 150 if i % 2 == 0 else o[2] == 0 for i, o in enumerate(outputs)))
                 for _ in range(2*hz):

@@ -2,6 +2,8 @@
 
 现行版本：**V21（2026-09-20）**。文件名保留历史V3命名，不表示设备使用版本3。版本协商、界面入口及尚未解决事项见[当前实现](CURRENT_SYSTEM_CN.md)。
 
+2026-10-04临时Raw观察模式：`sensor_algorithm.h` 中 `SENSOR_ALGO_BASELINE_ENABLED=0` 时，跳过运行时Baseline、Signal及触摸判定，三种输出模式均上传新增Type `0x16`。沿用V21的10字节`DATA`帧头，payload为`raw[0..N-1]`（小端uint16，长度`2*N`；当前食指20通道为40字节，总帧50字节）。温度及参数/命令回读保留，不执行300帧基线启动静默。上位机将此帧转为现有Debug采样对象，带`raw_only=true`，Baseline/Signal补0、未上传状态为-1、未计算的快慢K为NaN。GUI不变，在“柱状图设置”选择“Raw Val”即可显示3D柱体；压力标定和依赖Signal的功能暂不可用。宏改为1并重新编译即可恢复完整算法，原Signal/Debug布局保持兼容。下文输出模式表描述宏为1时的完整算法行为。
+
 V21变更：主法向支持1～30 N自动标定的完整10/20点表，同时兼容48点表；帧布局沿用V20，FCV9偏移和Flash占用不变。食指在新高力表有效、Signal达到首节点且换算达到1 N时切到高力输出，微力表独立保留。接收端兼容V14～V21；新短表须确认设备版本至少V21后写入。
 
 V20变更（2026-09-19）：Debug改为单一Raw、Baseline、Signal、Fast/Slow K、State，载荷为16×通道数；移除Norm/Candidate Raw和固定Noise，停止Slow Baseline计算及0x15上传。详见[单一Raw协议](RAW_PROTOCOL_V20_CN.md)。其余载荷沿用V19，V21继续使用这些布局。

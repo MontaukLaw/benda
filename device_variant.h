@@ -50,6 +50,8 @@
 #define DEVICE_MATRIX20 (0u)
 #endif
 #define DEVICE_HAS_FORCE_OUTPUT (!DEVICE_MATRIX20)
+/* 二十点矩阵连续输出实时Signal，旧五通道变体继续保留FLOATING锁定。 */
+#define DEVICE_HAS_FLOATING_LOCK (!DEVICE_MATRIX20)
 
 /* 设备信息能力位0表示支持CH4至CH7矩阵自动量程。 */
 #define DEVICE_CAPABILITY_MATRIX_AUTORANGE (1u << 0u)

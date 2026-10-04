@@ -304,8 +304,11 @@ int main(void) {
 		) {
 #if DEVICE_MATRIX20
 			/* 完整帧周期包含扫描、算法和串口服务开销。 */
-			CapSenseRuntime_SetFramePeriodUs(matrix_frame_cycles / (CY_CAPSENSE_CPU_CLK / 1000000u));
+			uint32_t frame_period_us = matrix_frame_cycles / (CY_CAPSENSE_CPU_CLK / 1000000u);
+			CapSenseRuntime_SetFramePeriodUs(frame_period_us);
 			matrix_frame_consumed();
+			/* 时基锁定可能更新默认周期，随后写入当前实际周期供恢复计时。 */
+			ChannelState_SetFramePeriodUs(frame_period_us);
 #endif
 			/* 在新 Nsub 的第一帧完成后重置滤波历史和 CapSense 基线。 */
 			if (CapSenseNsubControl_FinalizeAppliedScan()) {
@@ -324,8 +327,10 @@ int main(void) {
 				SensorAlgorithm_RestartBaselineInitialization();
 			}
 
-			/* Process all widgets */
+			/* Raw观察模式不执行CapSense运行时基线、差值及触摸后处理。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
 			Cy_CapSense_ProcessAllWidgets(&cy_capsense_context);
+#endif
 
 #if (TUNER_INTERFACE_TYPE == UART)
 			uart_command_receive();

@@ -1,4 +1,6 @@
 #include "capsense_runtime.h"
+/* 在线参数更新与算法共用Baseline开关。 */
+#include "sensor_algorithm.h"
 
 #include "cy_pdl.h"
 #include "cycfg_capsense.h"
@@ -304,12 +306,16 @@ void CapSenseRuntime_MarkScanComplete(void) {
 }
 
 bool CapSenseRuntime_UpdateBaselineIfPending(void) {
+/* Raw模式仍消费待办标志，但不运行会改写Raw的预处理或基线初始化。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
 	uint32_t widget_id;
+#endif
 
 	if (!baseline_update_pending) {
 		return false;
 	}
 	baseline_update_pending = false;
+#if SENSOR_ALGO_BASELINE_ENABLED
 	for (widget_id = 0u; widget_id < CY_CAPSENSE_TOTAL_WIDGET_COUNT; widget_id++) {
 		Cy_CapSense_PreProcessWidget(widget_id, &cy_capsense_context);
 	}
@@ -317,6 +323,9 @@ bool CapSenseRuntime_UpdateBaselineIfPending(void) {
 	Cy_CapSense_InitializeAllFilters(&cy_capsense_context);
 #endif
 	baseline_status = Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+#else
+	baseline_status = CY_CAPSENSE_STATUS_SUCCESS;
+#endif
 	return baseline_status == CY_CAPSENSE_STATUS_SUCCESS;
 }
 

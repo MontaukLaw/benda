@@ -84,16 +84,26 @@ typedef struct {
 	/* 保存单位为 0.01 %/s 的慢速归一化 K。 */
 	int32_t slow_normalized_k_x100;
 #if DEVICE_MATRIX20
+	/* 当前真实状态的累计微秒数，由统一提交入口复位。 */
+	uint32_t state_elapsed_us;
 	/* 保存最近快速下降证据的年龄，允许回落比例稍后达到松手门槛。 */
 	uint16_t release_edge_age_frames;
 	/* 下降证据只在当前活动周期短暂有效，不构成独立通道状态。 */
 	bool release_edge_valid;
 	/* 恢复周期保留受力前参考，低谷回弹不能单独作为再次按压依据。 */
 	uint16_t recovery_anchor_raw;
+	/* 当前恢复周期的再按压幅度门槛，进入恢复时按释放前峰值确定。 */
+	uint16_t recovery_retrigger_delta;
+	/* 恢复再按压候选的连续微秒数，只由统一提交入口确认或清除。 */
+	uint32_t retrigger_confirm_us;
+	/* 保存本轮明确加载前的可信平台，松手下冲不得降低此恢复参考。 */
+	uint16_t loading_reference_raw;
+	/* 保存活动保持期间最近一次窗口稳定的平台Raw，供下一次快加载读取。 */
+	uint16_t active_plateau_raw;
+	/* 平台仅在本轮稳定保持后有效，下降或恢复入口清除旧平台。 */
+	bool active_plateau_valid;
 	/* 连续慢下降确认后保留本轮证据，明确再加载或进入恢复时清除。 */
 	uint16_t slow_release_confirm_count;
-	/* 记录进入锁定时的压力，防止慢下降被逐帧补偿掩盖。 */
-	uint16_t floating_entry_pressure;
 #endif
 /* 结束通道状态机运行数据定义。 */
 } channel_state_machine_t;

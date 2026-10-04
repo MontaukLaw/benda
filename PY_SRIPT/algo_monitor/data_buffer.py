@@ -65,6 +65,8 @@ class AlgoDataBuffer:
         self._latest_sensor_frame_time = None
         self._latest_sensor_has_raw = False
         self._total_frames = 0
+        # 保存短队列供相对位移逐帧消费，避免GUI刷新只取末帧而漏掉轨迹。
+        self._pointer_samples = deque(maxlen=512)
         self._pending_channel_statistics = None
         self._channel_statistics = None
         self._version = 0
@@ -149,7 +151,19 @@ class AlgoDataBuffer:
                 self._slow_k_percent[channel].append(slow_k_percent_values[channel])
                 self._state_history[channel].append(self._states[channel])
             self._total_frames += 1
+            self._pointer_samples.append(dict(
+                sequence=self._total_frames, sample_timestamp=now,
+                has_raw=self._latest_sensor_has_raw, channel_count=channel_count,
+                raw=tuple(raw_values) if self._latest_sensor_has_raw else (),
+                signal=tuple(signal_values),
+                state=tuple(self._states) if self._latest_sensor_has_raw else ()))
             self._version += 1
+
+    def pointer_samples_after(self, sequence):
+        """返回独立快照；队列溢出由消费者通过序号缺口识别并断开轨迹。"""
+        with self._lock:
+            return [dict(sample) for sample in self._pointer_samples
+                    if sample['sequence'] > sequence]
 
     def start_raw_reference(self):
         with self._lock:

@@ -20,6 +20,7 @@ from config import (
     FRAME_TYPE_CHANNEL_4567_STATISTICS,
     FRAME_TYPE_SLOW_BASELINE,
     FRAME_TYPE_DEBUG,
+    FRAME_TYPE_RAW,
     FRAME_TYPE_FORCE_VECTOR,
     FRAME_TYPE_FINGER_PAD_FORCE_VECTOR,
     FRAME_TYPE_FORCE_CALIBRATION_PARAMETERS,
@@ -422,6 +423,20 @@ class AlgoFrameParser:
                 "result": payload[1],
                 "channel": payload[2],
                 "calibration_id": struct.unpack_from("<I", payload, 4)[0],
+            }
+
+        if frame_type == FRAME_TYPE_RAW:
+            if protocol_version < 21 or channel_count == 0 or payload_len != channel_count * BYTES_PER_VALUE:
+                return None
+            raw = struct.unpack(f"<{channel_count}H", payload)
+            # 复用现有监控采样链路；未上传状态用-1表示未知，不能伪造IDLE。
+            return {
+                "type": "debug", "device": device, "channel_count": channel_count,
+                "raw_only": True, "raw": raw,
+                "baseline": (0,) * channel_count, "signal": (0,) * channel_count,
+                "fast_k_percent": (float("nan"),) * channel_count,
+                "slow_k_percent": (float("nan"),) * channel_count,
+                "state": (-1,) * channel_count,
             }
 
         if frame_type == FRAME_TYPE_DEBUG:

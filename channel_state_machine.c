@@ -7,6 +7,14 @@
 /* 二十点矩阵只在初始化或重新校准时改变窗口长度，随后统一复位各通道。 */
 #if DEVICE_MATRIX20
 static uint32_t matrix_sample_rate_hz = DEVICE_ALGORITHM_FRAME_RATE_HZ;
+/* 保存真实完整帧周期，仅用于持续时间，窗口长度仍在校准时锁定。 */
+static uint32_t matrix_frame_period_us = 1000000u / DEVICE_ALGORITHM_FRAME_RATE_HZ;
+/* 主循环每帧提供实际周期，运行负载变化不得延长恢复超时。 */
+void ChannelState_SetFramePeriodUs(uint32_t frame_period_us) {
+	if (frame_period_us > 0u) {
+		matrix_frame_period_us = frame_period_us;
+	}
+}
 /* 返回最近一次测得并锁定的完整采样周期对应帧率。 */
 uint32_t ChannelState_GetSampleRateHz(void) {
 	return matrix_sample_rate_hz;
@@ -17,6 +25,8 @@ void ChannelState_SetSampleRateHz(uint32_t sample_rate_hz) {
 	if (matrix_sample_rate_hz > DEVICE_ALGORITHM_FRAME_RATE_HZ) {
 		matrix_sample_rate_hz = DEVICE_ALGORITHM_FRAME_RATE_HZ;
 	}
+	/* 独立算法回放与首次测量前使用锁定帧率对应周期。 */
+	matrix_frame_period_us = (1000000u + matrix_sample_rate_hz / 2u) / matrix_sample_rate_hz;
 }
 /* 数组容量不变，实际回归窗口按实测帧率对应约100毫秒和1秒。 */
 #undef CHANNEL_STATE_FAST_WINDOW_SAMPLES
@@ -37,17 +47,22 @@ void ChannelState_SetSampleRateHz(uint32_t sample_rate_hz) {
 #define CHANNEL_STATE_IDLE_CONFIRM_FRAMES (16u)
 #endif
 /* 保留原基线恢复的80帧等待和2 counts相邻变化门槛。 */
-/* 矩阵恢复等待维持旧食指约500毫秒的时长，其他变体保留原行为。 */
+/* 矩阵窗口已确认稳定后再等待250毫秒，避免重复长时间冻结。 */
 #if DEVICE_MATRIX20
-#define CHANNEL_STATE_BASELINE_STABLE_FRAMES SENSOR_ALGO_MILLISECONDS_TO_FRAMES(500u)
+#define CHANNEL_STATE_BASELINE_STABLE_FRAMES SENSOR_ALGO_MILLISECONDS_TO_FRAMES(250u)
 #else
 #define CHANNEL_STATE_BASELINE_STABLE_FRAMES (80u)
 #endif
 #define CHANNEL_STATE_BASELINE_STABLE_DELTA (2)
 /* 限制按压后稳定等待时长，持续噪声不能让Baseline永久冻结。 */
 #define CHANNEL_STATE_WAIT_STABLE_MAX_FRAMES (CHANNEL_STATE_BASELINE_STABLE_FRAMES * 4u)
-/* 快速恢复误差进入1 count后返回普通空闲跟随。 */
+/* 快速恢复完成后返回普通空闲跟随，矩阵单独容忍量化误差。 */
+#if DEVICE_MATRIX20
+/* 矩阵允许3 counts量化误差结束快速恢复，避免基线追逐单点噪声。 */
+#define CHANNEL_STATE_BASELINE_RECOVERED_ERROR (3u)
+#else
 #define CHANNEL_STATE_BASELINE_RECOVERED_ERROR (1u)
+#endif
 /* 矩阵采用40/32 counts迟滞，过滤日志中短暂负向回弹后的微小正残差。 */
 #if DEVICE_MATRIX20
 #define CHANNEL_STATE_PRESSURE_ON_MIN (40u)
@@ -71,11 +86,18 @@ void ChannelState_SetSampleRateHz(uint32_t sample_rate_hz) {
 #define CHANNEL_STATE_SLOW_BACK_RETRIGGER_RAW_COUNTS_PER_SECOND_MIN (80)
 /* 定义 SLOW_BACK 退出前允许的最大 Fast Raw 斜率绝对值，单位为 count/s。 */
 #define CHANNEL_STATE_SLOW_BACK_STABLE_RAW_COUNTS_PER_SECOND_MAX (20)
-/* 定义 SLOW_BACK 返回 IDLE 前需要连续稳定的帧数，约为 400 ms。 */
+/* 矩阵稳定确认缩短至250毫秒，其他变体保留400毫秒。 */
+#if DEVICE_MATRIX20
+#define CHANNEL_STATE_SLOW_BACK_STABLE_FRAMES SENSOR_ALGO_MILLISECONDS_TO_FRAMES(250u)
+/* 已确认松手最多等待8秒自然回弹，超时后仍须稳定才能重建零点。 */
+#define CHANNEL_STATE_SLOW_BACK_TIMEOUT_US (8000000u)
+#else
 #define CHANNEL_STATE_SLOW_BACK_STABLE_FRAMES SENSOR_ALGO_MILLISECONDS_TO_FRAMES(400u)
+#endif
 /* 定义 SLOW_BACK 自然回弹等待上限为 30 秒。 */
 #define CHANNEL_STATE_SLOW_BACK_TIMEOUT_FRAMES SENSOR_ALGO_SECONDS_TO_FRAMES(30u)
 /* 弱信号进入 ACTIVE_FLOATING 前至少持续激活约一秒，保留轻压抗量化抖动能力。 */
+#if DEVICE_HAS_FLOATING_LOCK
 #define CHANNEL_STATE_FLOATING_MIN_ACTIVE_FRAMES SENSOR_ALGO_SECONDS_TO_FRAMES(1u)
 /* 中高信号至少持续受力四秒再开始锁定确认，为分段加载和末段小步补压预留时间。 */
 #define CHANNEL_STATE_FLOATING_LOADED_MIN_ACTIVE_FRAMES SENSOR_ALGO_SECONDS_TO_FRAMES(4u)
@@ -87,6 +109,7 @@ void ChannelState_SetSampleRateHz(uint32_t sample_rate_hz) {
 #define CHANNEL_STATE_FLOATING_EXIT_FALLING_FAST_PERCENT_PER_SECOND_X100 (-10000)
 /* 定义 FLOATING 退出到普通活动状态前需要连续确认约 50 ms。 */
 #define CHANNEL_STATE_FLOATING_EXIT_CONFIRM_FRAMES SENSOR_ALGO_MILLISECONDS_TO_FRAMES(50u)
+#endif
 /* 定义进入上升状态的 Fast K 阈值为 +20.00 %/s。 */
 #define CHANNEL_STATE_RISING_FAST_PERCENT_PER_SECOND_X100 (2000)
 /* 定义快速窗口进入下降状态的阈值为 -30.00 %/s。 */
@@ -100,7 +123,9 @@ void ChannelState_SetSampleRateHz(uint32_t sample_rate_hz) {
 /* 定义慢速窗口被认为稳定时允许的最大绝对斜率。 */
 #define CHANNEL_STATE_SLOW_STABLE_PERCENT_PER_SECOND_X100 (500)
 /* 定义进入 ACTIVE_FLOATING 时允许的专用 Slow K 最大绝对斜率为 10.00 %/s。 */
+#if DEVICE_HAS_FLOATING_LOCK
 #define CHANNEL_STATE_FLOATING_SLOW_STABLE_PERCENT_PER_SECOND_X100 (1000)
+#endif
 /* 定义松手事件相对本次压力峰值至少需要下降的百分比。 */
 #define CHANNEL_STATE_RELEASE_TRIGGER_MIN_DROP_PERCENT (15u)
 /* 松手小压力边界固定为300 counts，避免降低噪声后破坏轻压保持。 */
@@ -123,13 +148,30 @@ void ChannelState_SetSampleRateHz(uint32_t sample_rate_hz) {
 #define CHANNEL_STATE_SLOW_RELEASE_REMAIN_PERCENT (50u)
 /* 残余上的重新按压已扣除旧负载，慢释放采用小压力相同的35%回落门槛。 */
 #define CHANNEL_STATE_RETRIGGER_SLOW_REMAIN_PERCENT (65u)
-/* 慢窗口达到普通下降门槛后连续确认200毫秒，兼顾缓慢卸载和量化噪声。 */
+/* 慢窗口达到矩阵下降门槛后连续确认200毫秒，兼顾缓慢卸载和量化噪声。 */
 #define CHANNEL_STATE_SLOW_RELEASE_CONFIRM_FRAMES SENSOR_ALGO_MILLISECONDS_TO_FRAMES(200u)
 /* 已明显下降四分之一的FALLING保持真实下降状态，直到再加载或释放完成。 */
 #define CHANNEL_STATE_FALLING_REMAIN_PERCENT (75u)
-/* FLOATING慢退出至少累计下降32 counts及锁定压力的5%，过滤微小蠕变。 */
-#define CHANNEL_STATE_FLOATING_SLOW_DROP_MIN (32u)
-#define CHANNEL_STATE_FLOATING_SLOW_DROP_PERCENT (5u)
+/* 慢回落采用-2%/s并保留幅度与卸载比例保护，兼容材料缓慢释放。 */
+#define CHANNEL_STATE_MATRIX_SLOW_FALLING_X100 (-200)
+/* 已释放后的稳定允许20 counts/s慢漂及短窗24 counts噪声范围。 */
+#define CHANNEL_STATE_MATRIX_SETTLED_RAW_COUNTS_PER_SECOND_MAX (20)
+#define CHANNEL_STATE_MATRIX_SETTLED_RAW_RANGE_MAX (24u)
+/* 恢复可跟随缓慢尾漂，但回到IDLE仍要求5 counts/s，防止尾漂重新触发按压。 */
+#define CHANNEL_STATE_MATRIX_IDLE_RAW_COUNTS_PER_SECOND_MAX (5)
+/* 矩阵首次按压优先要求200 counts/s快沿，避免慢漂叠加短窗噪声重新锁定。 */
+#define CHANNEL_STATE_MATRIX_PRESS_FAST_RAW_MIN (200)
+/* 缓慢真实加载可由完整慢窗40 counts/s确认，保留慢按压入口。 */
+#define CHANNEL_STATE_MATRIX_PRESS_SLOW_RAW_MIN (40)
+/* 恢复再按压采用独立幅度迟滞，过滤松手后约150 counts的正向回弹。 */
+#define CHANNEL_STATE_MATRIX_RETRIGGER_DELTA_MIN (200u)
+/* 大幅受力后的回弹按峰值5%加严，但限制为400 counts以保留再次按压。 */
+#define CHANNEL_STATE_MATRIX_RETRIGGER_PEAK_PERCENT (5u)
+#define CHANNEL_STATE_MATRIX_RETRIGGER_DELTA_MAX (400u)
+/* 恢复再按压要求明确快沿，普通首次按压仍使用原来的快慢入口。 */
+#define CHANNEL_STATE_MATRIX_RETRIGGER_FAST_RAW_MIN (500)
+/* 恢复候选必须连续成立80毫秒，使用真实帧周期而非锁定FPS换算。 */
+#define CHANNEL_STATE_MATRIX_RETRIGGER_CONFIRM_US (80000u)
 #else
 /* 其他手指保留原有近零比例。 */
 #define CHANNEL_STATE_SETTLED_PEAK_PERCENT (12u)
@@ -165,6 +207,14 @@ static uint16_t maximum_u16(uint16_t left, uint16_t right) {
 	return (left > right) ? left : right;
 /* 结束无符号整数最大值函数。 */
 }
+
+#if DEVICE_MATRIX20
+/* 再激活判定与提交零点共用同一可信参考，下冲不得在提交时降低零点。 */
+static uint16_t matrix_retrigger_reference(const channel_state_machine_t *machine,
+	uint16_t baseline, uint16_t local_reference) {
+	return maximum_u16(maximum_u16(baseline, machine->recovery_anchor_raw), local_reference);
+}
+#endif
 
 /* 向指定长度的滑动窗口追加一个 Raw 采样点。 */
 static void append_window_sample(
@@ -492,6 +542,14 @@ static void clear_normalized_k_telemetry(channel_state_machine_t *machine) {
 static void commit_state(channel_state_machine_t *machine, sensor_algorithm_state_t state, uint16_t raw, uint16_t baseline) {
 	/* 保存当前状态切换需要满足的连续确认帧数。 */
 	uint16_t required_frames = CHANNEL_STATE_DEBOUNCE_FRAMES;
+#if DEVICE_MATRIX20
+	/* 专用确认仅覆盖四个恢复状态到真实上升状态的切换。 */
+	bool recovery_retrigger = (state == SENSOR_ALGO_STATE_ACTIVE_RISING) &&
+		((machine->current_state == SENSOR_ALGO_STATE_SLOW_BACK) ||
+		 (machine->current_state == SENSOR_ALGO_STATE_ZERO_REBASE) ||
+		 (machine->current_state == SENSOR_ALGO_STATE_WAIT_STABLE) ||
+		 (machine->current_state == SENSOR_ALGO_STATE_RECOVER));
+#endif
 
 	/* 候选状态与当前状态相同时不需要切换。 */
 	if (state == machine->current_state) {
@@ -499,6 +557,10 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 		machine->pending_state = state;
 		/* 清除不再需要的候选状态累计帧数。 */
 		machine->pending_count = 0u;
+#if DEVICE_MATRIX20
+		/* 候选撤销后不得把不连续的回弹片段累计成再次按压。 */
+		machine->retrigger_confirm_us = 0u;
+#endif
 		/* 提前结束本次状态提交。 */
 		return;
 	/* 结束候选状态未改变分支。 */
@@ -518,7 +580,15 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 			 (!ChannelState_IsIdleLike(machine->current_state) &&
 			  machine->current_state != SENSOR_ALGO_STATE_SLOW_BACK &&
 			  machine->current_state != SENSOR_ALGO_STATE_ZERO_REBASE))) {
-			machine->recovery_anchor_raw = machine->activation_baseline;
+			/* 空闲扰动采用当前零点；已受力松手同时保护最近一次快加载前的稳定平台。 */
+			machine->recovery_anchor_raw = (machine->current_state == SENSOR_ALGO_STATE_IDLE)
+				? machine->activation_baseline
+				: maximum_u16(machine->activation_baseline, machine->loading_reference_raw);
+			/* 进入新恢复周期才重算幅度门槛，恢复状态互转不得丢失释放前峰值。 */
+			uint32_t delta = ((uint32_t)machine->peak_pressure * CHANNEL_STATE_MATRIX_RETRIGGER_PEAK_PERCENT) / 100u;
+			if (delta < CHANNEL_STATE_MATRIX_RETRIGGER_DELTA_MIN) delta = CHANNEL_STATE_MATRIX_RETRIGGER_DELTA_MIN;
+			if (delta > CHANNEL_STATE_MATRIX_RETRIGGER_DELTA_MAX) delta = CHANNEL_STATE_MATRIX_RETRIGGER_DELTA_MAX;
+			machine->recovery_retrigger_delta = (uint16_t)delta;
 		}
 #endif
 		/* 所有恢复状态仍只在本入口提交。 */
@@ -535,7 +605,8 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 		machine->release_edge_age_frames = 0u;
 		/* 恢复与空闲入口统一清除本轮慢释放及锁定参考。 */
 		machine->slow_release_confirm_count = 0u;
-		machine->floating_entry_pressure = 0u;
+		/* 恢复入口不继承上一轮活动平台，恢复锚点由上方统一保存。 */
+		machine->active_plateau_valid = false;
 #endif
 		/* 进入慢回弹时统一建立局部低点和稳定确认起点。 */
 		if (state == SENSOR_ALGO_STATE_SLOW_BACK) {
@@ -547,6 +618,16 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 		machine->baseline_stable_count = 0u;
 		/* 新状态从零开始累计持续时间。 */
 		machine->state_elapsed_frames = 0u;
+#if DEVICE_MATRIX20
+		/* 每次真实切换重新开始按实际帧周期计时。 */
+		machine->state_elapsed_us = 0u;
+		/* 进入任何新的恢复或空闲状态均撤销旧再按压候选。 */
+		machine->retrigger_confirm_us = 0u;
+		/* 超时进入零点重建的首帧先冻结，下一帧仍须由稳定判定允许跟随。 */
+		if (state == SENSOR_ALGO_STATE_ZERO_REBASE) {
+			machine->baseline_hold_requested = true;
+		}
+#endif
 		/* 将待确认状态同步为已经提交的新状态。 */
 		machine->pending_state = state;
 		/* 清除普通状态切换使用的消抖计数器。 */
@@ -557,6 +638,7 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 	}
 
 	/* 本轮峰值超过小压力分界时延长锁定确认，弱信号保留三帧确认以兼容量化抖动。 */
+#if DEVICE_HAS_FLOATING_LOCK
 	if ((state == SENSOR_ALGO_STATE_ACTIVE_FLOATING) &&
 		/* 沿用300 counts的小压力边界，用本轮峰值避免临界Raw噪声反复切换确认时长。 */
 		(machine->peak_pressure > CHANNEL_STATE_RELEASE_SMALL_LIMIT_COUNTS)) {
@@ -572,6 +654,7 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 		required_frames = CHANNEL_STATE_FLOATING_EXIT_CONFIRM_FRAMES;
 	/* 结束 FLOATING 专用退出确认帧数选择。 */
 	}
+#endif
 
 	/* 新候选状态与上一帧候选状态不同时重新开始计数。 */
 	if (state != machine->pending_state) {
@@ -579,6 +662,10 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 		machine->pending_state = state;
 		/* 将本帧记为候选状态连续出现的第一帧。 */
 		machine->pending_count = 1u;
+#if DEVICE_MATRIX20
+		/* 新候选从本帧真实周期开始计时，不沿用旧候选的时间。 */
+		machine->retrigger_confirm_us = recovery_retrigger ? matrix_frame_period_us : 0u;
+#endif
 		/* 等待后续帧继续确认，本帧不切换状态。 */
 		return;
 	/* 结束新候选状态初始化分支。 */
@@ -590,9 +677,33 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 		machine->pending_count++;
 	/* 结束候选状态计数递增分支。 */
 	}
-	/* 候选状态连续达到设定帧数后正式切换。 */
+#if DEVICE_MATRIX20
+	/* 连续恢复再按压候选采用饱和微秒累计，确认失败不改变真实恢复状态。 */
+	if (recovery_retrigger) {
+		if (UINT32_MAX - machine->retrigger_confirm_us < matrix_frame_period_us) {
+			machine->retrigger_confirm_us = UINT32_MAX;
+		} else {
+			machine->retrigger_confirm_us += matrix_frame_period_us;
+		}
+		if (machine->retrigger_confirm_us < CHANNEL_STATE_MATRIX_RETRIGGER_CONFIRM_US) return;
+	}
+#endif
+	/* 候选状态连续达到设定帧数及专用时间后正式切换。 */
 	if (machine->pending_count >= required_frames) {
 #if DEVICE_MATRIX20
+		/* 初次按压以真实空闲基线建立加载参考，不继承旧平台。 */
+		if ((state == SENSOR_ALGO_STATE_ACTIVE_RISING) &&
+			(machine->current_state == SENSOR_ALGO_STATE_IDLE)) {
+			machine->loading_reference_raw = baseline;
+		}
+		/* 稳定保持后的明确快加载保存原平台，随后松手回到此平台不构成新按压。 */
+		if ((state == SENSOR_ALGO_STATE_ACTIVE_RISING) &&
+			(machine->current_state == SENSOR_ALGO_STATE_ACTIVE_HOLD) &&
+			machine->active_plateau_valid &&
+			raw_slope_at_least(machine->fast_slope_numerator, CHANNEL_STATE_FAST_REGRESSION_DENOMINATOR,
+				CHANNEL_STATE_MATRIX_RETRIGGER_FAST_RAW_MIN)) {
+			machine->loading_reference_raw = maximum_u16(machine->activation_baseline, machine->active_plateau_raw);
+		}
 		/* 恢复后的新按压由提交入口一次性建立零点、峰值和斜率历史。 */
 		if ((state == SENSOR_ALGO_STATE_ACTIVE_RISING) &&
 			((machine->current_state == SENSOR_ALGO_STATE_SLOW_BACK) ||
@@ -603,7 +714,10 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 			uint16_t local_reference = ((machine->current_state == SENSOR_ALGO_STATE_SLOW_BACK) ||
 				(machine->current_state == SENSOR_ALGO_STATE_ZERO_REBASE))
 				? machine->slow_back_reference_raw : machine->recovery_reference_raw;
-			machine->activation_baseline = maximum_u16(baseline, local_reference);
+			/* 判定与进入处理采用同一参考，不能丢掉已保留的恢复锚点。 */
+			machine->activation_baseline = matrix_retrigger_reference(machine, baseline, local_reference);
+			/* 新的真实按压重新建立本轮加载参考。 */
+			machine->loading_reference_raw = machine->activation_baseline;
 			machine->peak_pressure = pressure_from_baseline(raw, machine->activation_baseline);
 			machine->active_elapsed_frames = 0u;
 			machine->idle_confirm_count = 0u;
@@ -611,12 +725,11 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 			machine->release_edge_valid = false;
 			machine->release_edge_age_frames = 0u;
 			machine->slow_release_confirm_count = 0u;
-			machine->floating_entry_pressure = 0u;
 			reset_slope_windows(machine, raw);
 		}
-		/* 进入锁定时保存一次压力，后续慢下降必须与此固定值比较。 */
-		if (state == SENSOR_ALGO_STATE_ACTIVE_FLOATING) {
-			machine->floating_entry_pressure = pressure_from_baseline(raw, machine->activation_baseline);
+		/* 上升或下降开始后须重新形成稳定保持平台，禁止复用旧负载平台。 */
+		if ((state == SENSOR_ALGO_STATE_ACTIVE_RISING) || (state == SENSOR_ALGO_STATE_ACTIVE_FALLING)) {
+			machine->active_plateau_valid = false;
 		}
 #else
 		/* 非矩阵变体继续使用原有受力参考处理。 */
@@ -626,6 +739,12 @@ static void commit_state(channel_state_machine_t *machine, sensor_algorithm_stat
 		machine->current_state = state;
 		/* 普通状态正式切换后重新开始累计状态持续时间。 */
 		machine->state_elapsed_frames = 0u;
+#if DEVICE_MATRIX20
+		/* 普通活动状态切换也统一复位实际持续时间。 */
+		machine->state_elapsed_us = 0u;
+		/* 已提交的新状态不保留本次再按压确认时间。 */
+		machine->retrigger_confirm_us = 0u;
+#endif
 		/* 状态切换完成后清零候选状态计数器。 */
 		machine->pending_count = 0u;
 	/* 结束普通状态切换确认分支。 */
@@ -712,7 +831,8 @@ static bool release_trigger_detected(
 /* 使用慢窗口斜率和短窗口幅度判断稳定，既识别持续回弹，也容忍少量量化噪声。 */
 static bool matrix_raw_is_settled(const channel_state_machine_t *machine) {
 	if ((machine->slow_sample_count < CHANNEL_STATE_SLOW_WINDOW_SAMPLES) ||
-		!raw_slope_is_stable(machine->slow_slope_numerator, CHANNEL_STATE_SLOW_REGRESSION_DENOMINATOR, 5)) {
+		!raw_slope_is_stable(machine->slow_slope_numerator, CHANNEL_STATE_SLOW_REGRESSION_DENOMINATOR,
+			CHANNEL_STATE_MATRIX_SETTLED_RAW_COUNTS_PER_SECOND_MAX)) {
 		return false;
 	}
 	uint16_t minimum = UINT16_MAX;
@@ -722,15 +842,18 @@ static bool matrix_raw_is_settled(const channel_state_machine_t *machine) {
 		if (value < minimum) minimum = value;
 		if (value > maximum) maximum = value;
 	}
-	return (maximum - minimum) <= 12u;
+	return (maximum - minimum) <= CHANNEL_STATE_MATRIX_SETTLED_RAW_RANGE_MAX;
 }
 
 /* 恢复中再次按压须同时越过可信基线与局部参考，并具有明确的正向变化。 */
 static bool matrix_retrigger_detected(const channel_state_machine_t *machine,
 	uint16_t raw, uint16_t baseline, uint16_t local_reference, uint16_t pressure_on) {
-	uint16_t reference = maximum_u16(maximum_u16(baseline, machine->recovery_anchor_raw), local_reference);
-	return ((uint32_t)raw > (uint32_t)reference + pressure_on) &&
-		raw_slope_at_least(machine->fast_slope_numerator, CHANNEL_STATE_FAST_REGRESSION_DENOMINATOR, 200);
+	uint16_t reference = matrix_retrigger_reference(machine, baseline, local_reference);
+	/* 恢复门槛独立于首次按压，并始终不低于正常激活幅度门槛。 */
+	uint16_t delta = maximum_u16(pressure_on, machine->recovery_retrigger_delta);
+	return ((uint32_t)raw > (uint32_t)reference + delta) &&
+		raw_slope_at_least(machine->fast_slope_numerator, CHANNEL_STATE_FAST_REGRESSION_DENOMINATOR,
+			CHANNEL_STATE_MATRIX_RETRIGGER_FAST_RAW_MIN);
 }
 #endif
 
@@ -776,6 +899,7 @@ static sensor_algorithm_state_t classify_state(
 			CHANNEL_STATE_SLOW_STABLE_PERCENT_PER_SECOND_X100);
 
 	/* ACTIVE_FLOATING 使用较宽松的专用 Slow K 稳定范围，以缩短蠕变锁定等待时间。 */
+#if DEVICE_HAS_FLOATING_LOCK
 	bool floating_slow_stable = (machine->slow_sample_count < CHANNEL_STATE_SLOW_WINDOW_SAMPLES) ||
 		/* 使用慢速窗口斜率检查是否进入 FLOATING 专用稳定范围。 */
 		normalized_slope_is_stable(
@@ -787,6 +911,7 @@ static sensor_algorithm_state_t classify_state(
 			normalization_reference,
 			/* 传入 FLOATING 专用 Slow K 稳定阈值。 */
 			CHANNEL_STATE_FLOATING_SLOW_STABLE_PERCENT_PER_SECOND_X100);
+#endif
 
 	/* 判断当前压力是否已经回落到本次峰值的 12% 以下。 */
 	bool settled_after_release = (machine->peak_pressure > 0u) &&
@@ -797,14 +922,29 @@ static sensor_algorithm_state_t classify_state(
 	if (machine->current_state == SENSOR_ALGO_STATE_IDLE) {
 #if DEVICE_MATRIX20
 		/* 明显负向形变进入公开的等待恢复状态，冻结零点直至回弹稳定。 */
-		if (((uint32_t)raw + pressure_on < baseline) && !matrix_raw_is_settled(machine)) {
+		if (((uint32_t)raw + pressure_on < baseline) &&
+			/* 空闲负向形变沿用严格尾漂门槛，不能因放宽恢复跟随而污染原零点。 */
+			(!matrix_raw_is_settled(machine) || !raw_slope_is_stable(machine->slow_slope_numerator,
+				CHANNEL_STATE_SLOW_REGRESSION_DENOMINATOR, CHANNEL_STATE_MATRIX_IDLE_RAW_COUNTS_PER_SECOND_MAX))) {
 			return SENSOR_ALGO_STATE_WAIT_STABLE;
 		}
 #endif
 		if (pressure > pressure_on) {
+			/* 恢复后回到IDLE也使用明确加载证据，单靠40 counts残差不构成按压。 */
+#if DEVICE_MATRIX20
+			bool press_detected = raw_slope_at_least(machine->fast_slope_numerator,
+				CHANNEL_STATE_FAST_REGRESSION_DENOMINATOR, CHANNEL_STATE_MATRIX_PRESS_FAST_RAW_MIN) ||
+				((machine->slow_sample_count >= CHANNEL_STATE_SLOW_WINDOW_SAMPLES) &&
+				 raw_slope_at_least(machine->fast_slope_numerator, CHANNEL_STATE_FAST_REGRESSION_DENOMINATOR,
+					CHANNEL_STATE_RISING_RAW_COUNTS_PER_SECOND_MIN) &&
+				 raw_slope_at_least(machine->slow_slope_numerator, CHANNEL_STATE_SLOW_REGRESSION_DENOMINATOR,
+					CHANNEL_STATE_MATRIX_PRESS_SLOW_RAW_MIN));
+			if (press_detected) {
+#else
 			if (raw_slope_at_least(machine->fast_slope_numerator,
 				CHANNEL_STATE_FAST_REGRESSION_DENOMINATOR,
 				CHANNEL_STATE_RISING_RAW_COUNTS_PER_SECOND_MIN)) {
+#endif
 				return SENSOR_ALGO_STATE_ACTIVE_RISING;
 			}
 			/* 尚未确认有效按压时保持IDLE，不启动按压后恢复。 */
@@ -850,9 +990,12 @@ static sensor_algorithm_state_t classify_state(
 #if DEVICE_MATRIX20
 		/* 回弹未稳定时暂停恢复；只有窗口稳定且基线贴近Raw才能重新进入IDLE。 */
 		bool raw_settled = matrix_raw_is_settled(machine);
+		/* 跟随恢复与重新开放空闲触发分开，漂移中的近零误差不能提前结束恢复。 */
+		bool idle_settled = raw_settled && raw_slope_is_stable(machine->slow_slope_numerator,
+			CHANNEL_STATE_SLOW_REGRESSION_DENOMINATOR, CHANNEL_STATE_MATRIX_IDLE_RAW_COUNTS_PER_SECOND_MAX);
 		if (machine->current_state == SENSOR_ALGO_STATE_RECOVER) {
 			if (!raw_settled) return SENSOR_ALGO_STATE_WAIT_STABLE;
-			return (error <= CHANNEL_STATE_BASELINE_RECOVERED_ERROR)
+			return (idle_settled && (error <= CHANNEL_STATE_BASELINE_RECOVERED_ERROR))
 				? SENSOR_ALGO_STATE_IDLE : SENSOR_ALGO_STATE_RECOVER;
 		}
 		if (raw_settled) {
@@ -861,7 +1004,7 @@ static sensor_algorithm_state_t classify_state(
 			machine->baseline_stable_count = 0u;
 		}
 		if (machine->baseline_stable_count >= CHANNEL_STATE_BASELINE_STABLE_FRAMES) {
-			return (error <= CHANNEL_STATE_BASELINE_RECOVERED_ERROR)
+			return (idle_settled && (error <= CHANNEL_STATE_BASELINE_RECOVERED_ERROR))
 				? SENSOR_ALGO_STATE_IDLE : SENSOR_ALGO_STATE_RECOVER;
 		}
 		return SENSOR_ALGO_STATE_WAIT_STABLE;
@@ -892,6 +1035,12 @@ static sensor_algorithm_state_t classify_state(
 
 	/* 当前处于 SLOW_BACK 时执行慢回弹屏蔽、重新按压和退出判断。 */
 	if (machine->current_state == SENSOR_ALGO_STATE_SLOW_BACK) {
+#if DEVICE_MATRIX20
+		/* 回弹平台已稳定后推进局部参考，禁止长期从历史谷底累计正向残差。 */
+		if (matrix_raw_is_settled(machine) && (raw > machine->slow_back_reference_raw)) {
+			machine->slow_back_reference_raw = raw;
+		}
+#endif
 		/* Raw 继续下降时同步刷新慢回弹阶段的局部低点。 */
 		if (raw < machine->slow_back_reference_raw) {
 			/* 将更低的 Raw 保存为重新按压判断参考值。 */
@@ -954,14 +1103,21 @@ static sensor_algorithm_state_t classify_state(
 			machine->slow_back_stable_count = 0u;
 		/* 结束 SLOW_BACK 退出稳定条件判断。 */
 		}
-		/* 连续稳定约400 ms后结束SLOW_BACK，统一入口将空闲候选转为WAIT_STABLE。 */
+		/* 连续稳定达到对应变体时长后结束SLOW_BACK，统一入口转为WAIT_STABLE。 */
 		if (machine->slow_back_stable_count >= CHANNEL_STATE_SLOW_BACK_STABLE_FRAMES) {
 			/* 返回空闲候选状态。 */
 			return SENSOR_ALGO_STATE_IDLE;
 		/* 结束 SLOW_BACK 返回 IDLE 判断。 */
 		}
-		/* 自然回弹等待达到 30 秒上限时转入受控零点重建。 */
-		if (machine->state_elapsed_frames >= CHANNEL_STATE_SLOW_BACK_TIMEOUT_FRAMES) {
+		/* 自然回弹等待达到对应变体上限时转入受控零点重建。 */
+		if (
+#if DEVICE_MATRIX20
+			/* 矩阵超时按真实周期累计，不能再由开机测得的较高FPS拉长。 */
+			machine->state_elapsed_us >= CHANNEL_STATE_SLOW_BACK_TIMEOUT_US
+#else
+			machine->state_elapsed_frames >= CHANNEL_STATE_SLOW_BACK_TIMEOUT_FRAMES
+#endif
+		) {
 			/* 清零恢复稳定计数，供 ZERO_REBASE 使用自己的退出确认。 */
 			machine->slow_back_stable_count = 0u;
 			/* 返回零点重建候选状态，统一入口将在本帧立即提交。 */
@@ -975,6 +1131,12 @@ static sensor_algorithm_state_t classify_state(
 
 	/* 当前处于 ZERO_REBASE 时优先检测重新按压和零点重建完成条件。 */
 	if (machine->current_state == SENSOR_ALGO_STATE_ZERO_REBASE) {
+#if DEVICE_MATRIX20
+		/* 零点重建与慢回弹使用同一稳定平台参考，旧谷底不能永久成为再按压起点。 */
+		if (matrix_raw_is_settled(machine) && (raw > machine->slow_back_reference_raw)) {
+			machine->slow_back_reference_raw = raw;
+		}
+#endif
 		/* Raw 继续下降时同步刷新重新按压使用的局部低点。 */
 		if (raw < machine->slow_back_reference_raw) {
 			/* 保存更低的 Raw 作为重新按压参考值。 */
@@ -1020,6 +1182,11 @@ static sensor_algorithm_state_t classify_state(
 #endif
 		/* Baseline 已追到 Raw 附近且快速窗口稳定时累计退出确认。 */
 		if ((baseline_error <= pressure_off) &&
+#if DEVICE_MATRIX20
+			/* 零点重建也必须等尾漂结束后开放IDLE触发，保持与RECOVER一致。 */
+			raw_slope_is_stable(machine->slow_slope_numerator, CHANNEL_STATE_SLOW_REGRESSION_DENOMINATOR,
+				CHANNEL_STATE_MATRIX_IDLE_RAW_COUNTS_PER_SECOND_MAX) &&
+#endif
 			/* 使用 Fast Raw 斜率限制避免在重新受压时错误退出。 */
 			raw_slope_is_stable(
 				/* 传入快速窗口斜率分子。 */
@@ -1062,7 +1229,9 @@ static sensor_algorithm_state_t classify_state(
 	/* 慢下降证据与累计卸载幅度分开确认，尾段变平不能抹去本轮真实下降。 */
 	bool slow_falling = (machine->slow_sample_count >= CHANNEL_STATE_SLOW_WINDOW_SAMPLES) &&
 		normalized_slope_at_most(machine->slow_slope_numerator, CHANNEL_STATE_SLOW_REGRESSION_DENOMINATOR,
-			normalization_reference, CHANNEL_STATE_FALLING_SLOW_PERCENT_PER_SECOND_X100) &&
+			/* 连续输出模式直接使用本轮真实压力峰值，不再维护锁定参考。 */
+			normalization_reference,
+			CHANNEL_STATE_MATRIX_SLOW_FALLING_X100) &&
 		!raw_slope_at_least(machine->fast_slope_numerator, CHANNEL_STATE_FAST_REGRESSION_DENOMINATOR,
 			CHANNEL_STATE_RISING_RAW_COUNTS_PER_SECOND_MIN);
 	/* 明确再加载撤销旧下降证据，静态长按和量化噪声不能单独累计松手确认。 */
@@ -1112,17 +1281,8 @@ static sensor_algorithm_state_t classify_state(
 	}
 
 	/* FLOATING 使用独立且带迟滞的退出门槛，避免弱压力下的归一化 K 放大量化噪声。 */
+#if DEVICE_HAS_FLOATING_LOCK
 	if (machine->current_state == SENSOR_ALGO_STATE_ACTIVE_FLOATING) {
-#if DEVICE_MATRIX20
-		/* 锁定期间持续慢下降且累计变化超出噪声时，也允许进入真实FALLING。 */
-		uint16_t floating_drop = (machine->floating_entry_pressure > pressure)
-			? machine->floating_entry_pressure - pressure : 0u;
-		if (slow_falling && (floating_drop >= CHANNEL_STATE_FLOATING_SLOW_DROP_MIN) &&
-			((uint32_t)floating_drop * 100u >=
-			 (uint32_t)machine->floating_entry_pressure * CHANNEL_STATE_FLOATING_SLOW_DROP_PERCENT)) {
-			return SENSOR_ALGO_STATE_ACTIVE_FALLING;
-		}
-#endif
 		/* Fast K 连续达到专用正向阈值时准备退出到 RISING。 */
 		if (normalized_slope_at_least(
 			/* 传入快速窗口斜率分子。 */
@@ -1157,6 +1317,7 @@ static sensor_algorithm_state_t classify_state(
 		return SENSOR_ALGO_STATE_ACTIVE_FLOATING;
 	/* 结束 FLOATING 专用迟滞分类分支。 */
 	}
+#endif
 
 	/* Fast K 达到上升阈值时判定为 ACTIVE_RISING。 */
 	if (normalized_slope_at_least(
@@ -1174,7 +1335,7 @@ static sensor_algorithm_state_t classify_state(
 	}
 
 #if DEVICE_MATRIX20
-	/* 持续慢下降优先于稳定锁定；明显卸载后的FALLING不因速度放缓重锁残余。 */
+	/* 持续慢下降保持FALLING，直到再加载或释放完成。 */
 	if (slow_falling || ((machine->current_state == SENSOR_ALGO_STATE_ACTIVE_FALLING) &&
 		(machine->peak_pressure > 0u) && ((uint32_t)pressure * 100u <=
 		 (uint32_t)machine->peak_pressure * CHANNEL_STATE_FALLING_REMAIN_PERCENT))) {
@@ -1183,6 +1344,7 @@ static sensor_algorithm_state_t classify_state(
 #endif
 
 	/* 沿用本轮峰值的300 counts边界，普通活动状态切换不会重启本轮受力等待。 */
+#if DEVICE_HAS_FLOATING_LOCK
 	uint32_t floating_min_active_frames = (machine->peak_pressure > CHANNEL_STATE_RELEASE_SMALL_LIMIT_COUNTS)
 		? CHANNEL_STATE_FLOATING_LOADED_MIN_ACTIVE_FRAMES : CHANNEL_STATE_FLOATING_MIN_ACTIVE_FRAMES;
 	/* 达到对应受力时长后才允许稳定锁定候选，继续优先于普通慢速下降分类。 */
@@ -1190,6 +1352,7 @@ static sensor_algorithm_state_t classify_state(
 		/* 仅形成候选，由统一状态入口按本轮压力幅度执行连续稳定确认。 */
 		return SENSOR_ALGO_STATE_ACTIVE_FLOATING;
 	}
+#endif
 
 	/* Fast K 达到快速下降阈值，或 Slow K 达到慢速下降阈值时判定下降。 */
 	if (normalized_slope_at_most(
@@ -1218,7 +1381,7 @@ static sensor_algorithm_state_t classify_state(
 	/* 结束下降状态判断。 */
 	}
 
-	/* 尚未达到蠕变锁定时间时，快慢窗口同时稳定则判定为 ACTIVE_HOLD。 */
+	/* 快慢窗口同时稳定时进入HOLD，矩阵Signal仍连续跟随实际Raw差值。 */
 	if (fast_stable && slow_stable) {
 		/* 返回保持候选状态。 */
 		return SENSOR_ALGO_STATE_ACTIVE_HOLD;
@@ -1226,7 +1389,12 @@ static sensor_algorithm_state_t classify_state(
 	}
 
 	/* 没有任何新状态条件成立时延续当前状态。 */
+#if DEVICE_HAS_FLOATING_LOCK
 	return machine->current_state;
+#else
+	/* 矩阵只返回上升、下降或稳定候选，不保留无法分类的历史活动状态。 */
+	return SENSOR_ALGO_STATE_ACTIVE_HOLD;
+#endif
 /* 结束候选状态分类函数。 */
 }
 
@@ -1250,6 +1418,11 @@ void ChannelState_Reset(channel_state_machine_t *machine, uint16_t raw, uint16_t
 #if DEVICE_MATRIX20
 	/* 复位同时建立可信恢复参考，不继承上次负向低谷。 */
 	machine->recovery_anchor_raw = baseline;
+	/* 校准复位不继承上一轮大压力的恢复迟滞或确认时间。 */
+	machine->recovery_retrigger_delta = CHANNEL_STATE_MATRIX_RETRIGGER_DELTA_MIN;
+	/* 初始加载参考与平台统一由校准零点建立，不继承旧受力历史。 */
+	machine->loading_reference_raw = baseline;
+	machine->active_plateau_raw = raw;
 #endif
 	/* 将当前通道状态初始化为 IDLE。 */
 	machine->current_state = SENSOR_ALGO_STATE_IDLE;
@@ -1292,6 +1465,10 @@ sensor_algorithm_state_t ChannelState_Update(channel_state_machine_t *machine, c
 		machine->release_edge_valid = false;
 		machine->release_edge_age_frames = 0u;
 		machine->slow_release_confirm_count = 0u;
+		/* 切档抑制撤销未完成的恢复再按压时间。 */
+		machine->retrigger_confirm_us = 0u;
+		/* 切档抑制撤销活动平台，合成轨迹不能成为真实加载参考。 */
+		machine->active_plateau_valid = false;
 #endif
 
 		/* 切档期间不累计空闲或慢回弹稳定帧数。 */
@@ -1320,6 +1497,10 @@ sensor_algorithm_state_t ChannelState_Update(channel_state_machine_t *machine, c
 		machine->release_edge_valid = false;
 		machine->release_edge_age_frames = 0u;
 		machine->slow_release_confirm_count = 0u;
+		/* 切档结束重建窗口时，恢复候选必须重新计时。 */
+		machine->retrigger_confirm_us = 0u;
+		/* 新量程必须重新积累稳定平台，不能跨量程继承旧Raw。 */
+		machine->active_plateau_valid = false;
 #endif
 
 		/* 清除切档前尚未完成的状态和空闲确认计数。 */
@@ -1343,6 +1524,13 @@ sensor_algorithm_state_t ChannelState_Update(channel_state_machine_t *machine, c
 
 	/* 正常工作时把本帧Raw加入快慢窗口。 */
 	append_raw(machine, input->raw);
+#if DEVICE_MATRIX20
+	/* 稳定HOLD只记录观测平台，不改写状态、基线或输出，也不触发超时清零。 */
+	if ((machine->current_state == SENSOR_ALGO_STATE_ACTIVE_HOLD) && matrix_raw_is_settled(machine)) {
+		machine->active_plateau_raw = input->raw;
+		machine->active_plateau_valid = true;
+	}
+#endif
 	/* 空闲、等待和恢复阶段不累计活动持续时间。 */
 	if (ChannelState_IsIdleLike(machine->current_state)) {
 		/* 清零活动累计帧数，等待下一轮有效按压重新开始。 */
@@ -1359,6 +1547,14 @@ sensor_algorithm_state_t ChannelState_Update(channel_state_machine_t *machine, c
 		machine->state_elapsed_frames++;
 	/* 结束状态持续帧数递增分支。 */
 	}
+#if DEVICE_MATRIX20
+	/* 累计实际帧周期并饱和，避免长时间运行后超时计数回绕。 */
+	if (UINT32_MAX - machine->state_elapsed_us < matrix_frame_period_us) {
+		machine->state_elapsed_us = UINT32_MAX;
+	} else {
+		machine->state_elapsed_us += matrix_frame_period_us;
+	}
+#endif
 
 	/* 尚未校准或上层要求抑制活动时强制保持 IDLE。 */
 	if (!input->calibrated || input->suppress_activity) {
@@ -1381,7 +1577,6 @@ sensor_algorithm_state_t ChannelState_Update(channel_state_machine_t *machine, c
 		machine->release_edge_valid = false;
 		machine->release_edge_age_frames = 0u;
 		machine->slow_release_confirm_count = 0u;
-		machine->floating_entry_pressure = 0u;
 #endif
 		commit_state(machine, SENSOR_ALGO_STATE_IDLE, input->raw, input->baseline);
 		/* 返回强制空闲后的当前状态。 */
@@ -1414,6 +1609,12 @@ sensor_algorithm_state_t ChannelState_Update(channel_state_machine_t *machine, c
 	machine->baseline_hold_requested = (previous_state == SENSOR_ALGO_STATE_IDLE) && (pressure > pressure_on);
 	/* 根据 Raw、压力和快慢斜率计算本帧候选状态。 */
 	candidate = classify_state(machine, input->raw, input->baseline, pressure, pressure_on, pressure_off, normalization_reference);
+#if DEVICE_MATRIX20
+	/* IDLE只有完整按压候选才冻结，未确认的慢漂继续跟随，避免基线永久停在旧零点。 */
+	if (previous_state == SENSOR_ALGO_STATE_IDLE) {
+		machine->baseline_hold_requested = candidate == SENSOR_ALGO_STATE_ACTIVE_RISING;
+	}
+#endif
 	/* 普通活动结束先明确等待；ZERO_REBASE已完成零点重建，直接回IDLE。 */
 	if ((candidate == SENSOR_ALGO_STATE_IDLE) && !ChannelState_IsIdleLike(previous_state) &&
 		(previous_state != SENSOR_ALGO_STATE_ZERO_REBASE)) {

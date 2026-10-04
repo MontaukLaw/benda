@@ -1,5 +1,7 @@
 /* 引入本模块公开接口。 */
 #include "capsense_nsub_control.h"
+/* 三参数首帧初始化与算法共用Baseline开关，Raw模式不改写扫描值。 */
+#include "sensor_algorithm.h"
 
 /* 引入全部逻辑通道三参数同步与实际值回读接口。 */
 #include "capsense_channel_config.h"
@@ -483,10 +485,13 @@ bool CapSenseNsubControl_ApplyPending(void) {
 
 /* 在新 Nsub 的第一帧扫描结束后重置 CapSense 滤波器和基线。 */
 bool CapSenseNsubControl_FinalizeAppliedScan(void) {
+/* 关闭Baseline时仅完成参数事务，不执行预处理、滤波或基线初始化。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
 	/* 保存当前 Widget 序号。 */
 	uint32_t widget_id;
 	/* 保存 CapSense 基线初始化结果。 */
 	cy_capsense_status_t baseline_status;
+#endif
 
 	/* 尚未完成新配置的第一帧时无需处理。 */
 	if (!first_scan_finalize_pending) {
@@ -498,6 +503,8 @@ bool CapSenseNsubControl_FinalizeAppliedScan(void) {
 	/* 消费首帧初始化任务。 */
 	first_scan_finalize_pending = false;
 
+/* 仅完整算法模式需要按新Raw量级重建CapSense基线。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
 	/* 先为每个 Widget 预处理刚完成的新 Nsub 原始数据。 */
 	for (widget_id = 0u; widget_id < CY_CAPSENSE_TOTAL_WIDGET_COUNT; widget_id++) {
 		/* 执行当前 Widget 的预处理。 */
@@ -514,11 +521,13 @@ bool CapSenseNsubControl_FinalizeAppliedScan(void) {
 
 	/* 用新 Nsub 的首帧数据重新建立 CapSense 基线。 */
 	baseline_status = Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+#endif
 	/* 清除对外的等待状态。 */
 	control_status.pending = 0u;
 	matrix_config_status.pending = 0u;
 
 	/* 基线初始化失败时记录设置失败。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
 	if (CY_CAPSENSE_STATUS_SUCCESS != baseline_status) {
 		/* 保存失败结果供上位机显示。 */
 		control_status.result = (uint8_t)CAPSENSE_NSUB_CONTROL_RESULT_SET_FAILED;
@@ -526,6 +535,7 @@ bool CapSenseNsubControl_FinalizeAppliedScan(void) {
 		return false;
 	/* 结束基线初始化失败分支。 */
 	}
+#endif
 
 	/* 报告算法层需要针对新量程执行在线重校准。 */
 	return true;
@@ -686,13 +696,18 @@ bool CapSenseNsubControl_ApplyPending(void) {
 
 /* 新三参数首帧完成后重建滤波历史和全部CapSense基线。 */
 bool CapSenseNsubControl_FinalizeAppliedScan(void) {
+/* Raw模式保留三参数事务结束逻辑，跳过全部采样后处理。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
 	uint32_t widget_id;
 	cy_capsense_status_t baseline_status;
+#endif
 
 	if (!first_scan_finalize_pending) {
 		return false;
 	}
 	first_scan_finalize_pending = false;
+/* 完整算法模式才重建滤波历史和基线。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
 	for (widget_id = 0u;
 		 widget_id < CY_CAPSENSE_TOTAL_WIDGET_COUNT;
 		 widget_id++) {
@@ -702,14 +717,18 @@ bool CapSenseNsubControl_FinalizeAppliedScan(void) {
 	Cy_CapSense_InitializeAllFilters(&cy_capsense_context);
 	#endif
 	baseline_status = Cy_CapSense_InitializeAllBaselines(&cy_capsense_context);
+#endif
 	control_status.pending = 0u;
 	matrix_config_status.pending = 0u;
+/* Raw模式不产生基线初始化错误。 */
+#if SENSOR_ALGO_BASELINE_ENABLED
 	if (CY_CAPSENSE_STATUS_SUCCESS != baseline_status) {
 		control_status.result =
 			(uint8_t)CAPSENSE_NSUB_CONTROL_RESULT_SET_FAILED;
 		matrix_config_status.result = control_status.result;
 		return false;
 	}
+#endif
 	return true;
 }
 

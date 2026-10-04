@@ -428,6 +428,11 @@ static void app_iic_build_live_data_frame(uint8_t *frame) {
 }
 
 static uint32_t app_iic_get_channel_value(const sensor_algorithm_snapshot_t *snapshot, uint32_t channel_index) {
+/* Raw观察模式沿用I2C原始值编码，不再上传放大的Signal或基线值。 */
+#if !SENSOR_ALGO_BASELINE_ENABLED
+	uint32_t active_bit = SensorAlgorithm_IsContactActiveState(snapshot->states[channel_index]) ? 1u : 0u;
+	return ((uint32_t)snapshot->channels[channel_index].raw << 1u) | active_bit;
+#else
 	uint32_t value;
 	uint16_t raw = snapshot->channels[channel_index].raw;
 	uint16_t baseline = snapshot->channels[channel_index].baseline;
@@ -459,6 +464,7 @@ static uint32_t app_iic_get_channel_value(const sensor_algorithm_snapshot_t *sna
 	}
 
 	return (value << 1u) | active_bit;
+#endif
 }
 
 static uint16_t app_iic_scale_force_x100(float value) {

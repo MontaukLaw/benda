@@ -36,10 +36,10 @@ sys.excepthook=lambda *args: errors.append(args)
 window=MainWindow()
 window.show()
 app.processEvents()
-assert [window.control_tabs.tabText(i) for i in range(window.control_tabs.count())] == ['监控','波形设置','三参数','串口日志','固件升级']
+assert [window.control_tabs.tabText(i) for i in range(window.control_tabs.count())] == ['监控','波形设置','三参数','串口日志','固件升级','触摸板','表盘设置','柱状图设置']
 graphs = window.main_splitter.widget(0)
-assert [window.plot_tabs.tabText(i) for i in range(window.plot_tabs.count())] == ['波形图','阵列质心']
-assert window.plot_tabs.currentWidget() is window.centroid_view
+assert [window.plot_tabs.tabText(i) for i in range(window.plot_tabs.count())] == ['波形图','阵列质心','触摸板光标','圆形表盘','3D柱状图']
+assert window.plot_tabs.currentWidget() is window.watch_face
 assert window.centroid_view.centroid is None
 assert CHANNEL_GRID == ((0,4,8,12,16),(1,5,9,13,17),(2,6,10,14,18),(3,7,11,15,19))
 assert window.centroid_scale_slider.value() == 70

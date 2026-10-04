@@ -17,6 +17,11 @@
 /* 所有应用算法暂按每通道噪声1 count计算；校准不再改变阈值。 */
 #define SENSOR_ALGO_FIXED_NOISE (1u)
 
+/* 临时Raw观察模式：设为1恢复Baseline、Signal及压力算法，设为0直接上传硬件Raw。 */
+#ifndef SENSOR_ALGO_BASELINE_ENABLED
+#define SENSOR_ALGO_BASELINE_ENABLED (0u)
+#endif
+
 /*
  * 定义 UART 算法协议版本。
  * V14增加设备信息查询和设备信息响应，用于上位机自动识别手指类型。
@@ -94,6 +99,8 @@
 #if DEVICE_MATRIX20
 uint32_t ChannelState_GetSampleRateHz(void);
 void ChannelState_SetSampleRateHz(uint32_t sample_rate_hz);
+/* 主循环提供完整帧周期，恢复超时使用真实时间而非启动时FPS。 */
+void ChannelState_SetFramePeriodUs(uint32_t frame_period_us);
 #define SENSOR_ALGO_FRAME_RATE_HZ ChannelState_GetSampleRateHz()
 #else
 #define SENSOR_ALGO_FRAME_RATE_HZ DEVICE_ALGORITHM_FRAME_RATE_HZ
@@ -208,7 +215,7 @@ typedef enum {
 	SENSOR_ALGO_STATE_SLOW_BACK = 4u,
 	/* 慢回弹超时且残余偏移无法自然消除，正在重建零点。 */
 	SENSOR_ALGO_STATE_ZERO_REBASE = 5u,
-	/* 稳定按压持续足够久后锁定输出，并吸收材料缓慢蠕变。 */
+	/* 旧五通道变体的锁定状态；保留协议编号6，二十点矩阵不再产生此状态。 */
 	SENSOR_ALGO_STATE_ACTIVE_FLOATING = 6u,
 	/* 稳定等待完成后，基线以0.02恢复，完成后返回IDLE。 */
 	SENSOR_ALGO_STATE_RECOVER = 7u,

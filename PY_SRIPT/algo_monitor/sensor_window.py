@@ -9,6 +9,9 @@ from config import MIN_HISTORY_LENGTH, MAX_HISTORY_LENGTH, OUTPUT_MODE_DEBUG, OU
 from channel_states import STATE_NAMES, IDLE_LIKE_STATES
 from data_buffer import AlgoDataBuffer, RX_FPS_STALE_SECONDS
 from centroid_view import CentroidView
+from touchpad_view import TouchpadPanel
+from watch_face_view import WatchFaceCanvas, WatchFacePanel
+from array_bar_view import ArrayBarView, ArrayBarPanel
 from data_recorder import SerialDataRecorder
 from rolling_serial_log import RollingSerialLog
 from recent_data_export import RecentDataExportThread
@@ -87,6 +90,10 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.instance().installEventFilter(self)
 
     def eventFilter(self, watched, event):
+        if (event.type() == QtCore.QEvent.Type.KeyPress and event.key() == QtCore.Qt.Key.Key_Escape
+                or event.type() == QtCore.QEvent.Type.ApplicationDeactivate):
+            self.touchpad.stop_mouse()
+            self.watch_face.cancel_gesture()
         if event.type() == QtCore.QEvent.Type.Wheel:
             target = watched
             while target is not None:
@@ -336,6 +343,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.control_tabs.addTab(parameter_tab, '三参数')
         self._build_log_tab()
         self._build_dfu()
+        self.touchpad = TouchpadPanel(self._log_touchpad)
+        self.plot_tabs.addTab(self.touchpad.canvas, '触摸板光标')
+        self.control_tabs.addTab(self.touchpad, '触摸板')
+        for widget in (self.touchpad.sensitivity, self.touchpad.threshold, self.touchpad.cutoff):
+            widget.valueChanged.connect(self._schedule_save)
+        self.watch_face = WatchFaceCanvas()
+        self.watch_settings = WatchFacePanel(self.watch_face)
+        self.plot_tabs.addTab(self.watch_face, '圆形表盘')
+        self.control_tabs.addTab(self.watch_settings, '表盘设置')
+        self.watch_settings.settings_changed.connect(self._schedule_save)
+        self.watch_settings.reference_requested.connect(lambda: self.control_tabs.setCurrentWidget(self.touchpad))
+        self.array_bars = ArrayBarView()
+        self.array_bar_settings = ArrayBarPanel(self.array_bars)
+        self.plot_tabs.addTab(self.array_bars, '3D柱状图')
+        self.control_tabs.addTab(self.array_bar_settings, '柱状图设置')
+        self.array_bar_settings.settings_changed.connect(self._schedule_save)
+        self.touchpad.motion_sample.connect(self.watch_face.sensor_sample)
+        self.touchpad.system_mouse.toggled.connect(self._watch_mouse_changed)
+        self.plot_tabs.currentChanged.connect(self._watch_tab_changed)
+        self.plot_tabs.setCurrentWidget(self.watch_face)
         self.status_label = QtWidgets.QLabel('选择传感器串口后连接')
         self.status_label.setWordWrap(True)
         root.addWidget(self.live_status)
@@ -352,7 +379,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QPushButton:disabled { color:#6a7781; }
             QHeaderView::section { background:#1b2935; padding:6px; border:0; }
             QTableWidget { gridline-color:#263441; }
-            QLineEdit, QSpinBox, QComboBox { background:#121e28; border:1px solid #456074; padding:4px; }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background:#121e28; border:1px solid #456074; padding:4px; }
             QCheckBox::indicator { width:16px; height:16px; border:1px solid #617e92; border-radius:2px; background:#080d13; }
             QCheckBox::indicator:checked { background:#52d2f3; border-color:#8deaff; }
             QRadioButton::indicator { width:16px; height:16px; border:1px solid #617e92; border-radius:8px; background:#080d13; }
@@ -425,6 +452,22 @@ class MainWindow(QtWidgets.QMainWindow):
         problem = bool(status['error'] or status['dropped'] or status['retention_error'])
         self.control_tabs.setTabText(self.control_tabs.indexOf(self.log_status_label.parentWidget()), '串口日志 ⚠' if problem else '串口日志')
         self.log_status_label.setStyleSheet('color:#ff8d78;' if problem else '')
+
+    def _log_touchpad(self, frame):
+        if self._connected:
+            self.rolling_log.submit('touchpad', port=self.current_port, frame=frame)
+
+    def _watch_tab_changed(self, *_):
+        if self.plot_tabs.currentWidget() is self.watch_face:
+            self.touchpad.stop_mouse()
+            self.control_tabs.setCurrentWidget(self.watch_settings)
+        elif self.plot_tabs.currentWidget() is self.array_bars:
+            self.control_tabs.setCurrentWidget(self.array_bar_settings)
+
+    def _watch_mouse_changed(self, enabled):
+        if enabled and self.plot_tabs.currentWidget() is self.watch_face:
+            self.touchpad.stop_mouse()
+            self.status_label.setText('表盘直接接收触摸手势，无需开启系统鼠标控制')
 
     def _centroid_smoothing_changed(self, enabled):
         self.centroid_view.smoothing_enabled = enabled
@@ -576,6 +619,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _set_connected(self, connected):
+        if bool(connected) != self._connected:
+            self.touchpad.invalidate('连接已改变，请松手重新采集触摸板参考')
         self._connected = bool(connected)
         self.connect_button.setText('Disconnect' if connected else 'Connect')
         for widget in (self.recal_button,self.mode_apply_button,self.params_apply_button,self.params_read_button):
@@ -589,6 +634,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def recalibrate(self):
         if self.reader is not None and self.reader.send_recalibration():
+            self.touchpad.invalidate('固件基线重新校准，请松手重新采集触摸板参考')
             self.status_label.setText('已请求全部通道重新校准基线，请保持释放')
 
     def on_device_info(self, frame):
@@ -614,6 +660,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.nsub_status_label.setText('TxDivider必须为偶数')
             return
         if self.reader.set_matrix_config(nsub,tx,ref):
+            self.touchpad.invalidate('三参数已改变，请松手重新采集触摸板参考')
             self._requested_params = (nsub,tx,ref)
             self._params_dirty = False
             self._params_pending = True
@@ -649,6 +696,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_capsense_channel_config(self, frame):
         channels = frame.get('channels',())
+        signature = tuple((c.get('channel'), c.get('hardware_nsub'),
+                           c.get('hardware_tx_clk_div'), c.get('hardware_ref_cdac')) for c in channels)
+        previous_signature = getattr(self, '_touchpad_config_signature', None)
+        if previous_signature is not None and signature != previous_signature:
+            self.touchpad.invalidate('硬件参数已改变，请松手重新采集触摸板参考')
+        self._touchpad_config_signature = signature
         self.capsense_parameter_table.setRowCount(len(channels))
         mismatches = []
         for row,channel in enumerate(channels):
@@ -748,9 +801,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.raw_plot.removeItem(self._state_regions.pop())
 
     def refresh_plots(self):
+        self.touchpad.process_samples(self.data_buffer.pointer_samples_after(self.touchpad.last_sequence))
         raw,base,sig,fast,slow,states,histories,fps,frames,count,channels,_,_,version = self.data_buffer.snapshot()
         sample = self.data_buffer.latest_sensor_sample()
         self._refresh_centroid(sample)
+        self.array_bars.set_sample(sample)
         temperature = '--'
         if sample and sample['die_temperature_celsius'] is not None and (sample['die_temperature_age_seconds'] or 0) < 5:
             temperature = f"{sample['die_temperature_celsius']:.1f} °C"
@@ -865,6 +920,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def save_display_config(self):
         config = {'history':self.history_input.value(),'background':self.state_background_channel_combo.currentData(),
+                  'touchpad':self.touchpad.settings(),
+                  'watch_face':self.watch_settings.settings(),
+                  'array_bars':self.array_bar_settings.settings(),
                   'centroid_smoothing':self.centroid_smoothing_checkbox.isChecked(),
                   'centroid_local_2x2':self.centroid_local_2x2_checkbox.isChecked(),
                   'centroid_raw':self.centroid_raw_checkbox.isChecked(),
@@ -886,6 +944,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_display_config(self):
         try:
             config = json.loads(self._config_path.read_text(encoding='utf-8'))
+            self.touchpad.load_settings(config.get('touchpad', {}))
+            self.watch_settings.load_settings(config.get('watch_face', {}))
+            self.array_bar_settings.load_settings(config.get('array_bars', {}))
             self._centroid_signal_threshold = max(0,min(65535,int(config.get('centroid_signal_threshold',100))))
             self.centroid_threshold_input.setValue(self._centroid_signal_threshold)
             self.centroid_view.position_filter.set_signal_threshold(self._centroid_signal_threshold)
@@ -914,6 +975,8 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def closeEvent(self, event):
+        self.touchpad.stop_mouse()
+        self.watch_face.cancel_gesture()
         if self.dfu_thread is not None:
             self.status_label.setText('固件升级进行中，请等待完成后关闭')
             event.ignore()

@@ -9,8 +9,13 @@
 /* 其他手指保持原有空闲跟随速度。 */
 #define BASELINE_IDLE_ALPHA_Q16 (327u)
 #endif
-/* 已确认释放后的恢复和零点重建仍使用快速跟随。 */
+/* 矩阵稳定释放后将恢复系数提高至0.04，缩短零点重建尾段。 */
+#if DEVICE_MATRIX20
+#define BASELINE_RECOVERY_ALPHA_Q16 (2621u)
+#else
+/* 其他手指保留原有0.02恢复系数。 */
 #define BASELINE_RECOVERY_ALPHA_Q16 (1311u)
+#endif
 
 /* 显式按状态选择跟随速度，未列出的状态一律冻结。 */
 void BaselineTracker_Update(const baseline_tracker_input_t *input, uint32_t *baseline_q16) {
