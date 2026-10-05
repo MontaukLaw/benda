@@ -164,7 +164,12 @@ class WatchFaceCanvas(QtWidgets.QWidget):
             return
         now=sample['timestamp']
         if sample.get('cancel'):
-            if self._input_source=='sensor':self.cancel_gesture()
+            if self._input_source=='sensor':
+                self.cancel_gesture()
+                # 条件失效时仅吸附最近项，不沿用拖动速度；清除来源后连续释放帧不会重启动画。
+                if sample.get('snap_on_cancel'):
+                    self.model.snap(now)
+                    self.update()
             return
         if sample['contact']:
             if self.owner!='sensor':

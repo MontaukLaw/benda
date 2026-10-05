@@ -32,13 +32,17 @@ for name in ('msyh.ttc','segoeui.ttf'):
     font = Path('C:/Windows/Fonts')/name
     if font.exists(): QtGui.QFontDatabase.addApplicationFont(str(font))
 errors=[]
-sys.excepthook=lambda *args: errors.append(args)
+def report_exception(*args):
+    import traceback
+    errors.append(args)
+    traceback.print_exception(*args)
+sys.excepthook=report_exception
 window=MainWindow()
 window.show()
 app.processEvents()
-assert [window.control_tabs.tabText(i) for i in range(window.control_tabs.count())] == ['监控','波形设置','三参数','串口日志','固件升级','触摸板','表盘设置','柱状图设置']
+assert [window.control_tabs.tabText(i) for i in range(window.control_tabs.count())] == ['监控','波形设置','三参数','串口日志','固件升级','触摸板','表盘设置','柱状图设置','基线与状态机']
 graphs = window.main_splitter.widget(0)
-assert [window.plot_tabs.tabText(i) for i in range(window.plot_tabs.count())] == ['波形图','阵列质心','触摸板光标','圆形表盘','3D柱状图']
+assert [window.plot_tabs.tabText(i) for i in range(window.plot_tabs.count())] == ['波形图','阵列质心','触摸板光标','滑动测试','圆形表盘','3D柱状图']
 assert window.plot_tabs.currentWidget() is window.watch_face
 assert window.centroid_view.centroid is None
 assert CHANNEL_GRID == ((0,4,8,12,16),(1,5,9,13,17),(2,6,10,14,18),(3,7,11,15,19))
@@ -67,8 +71,8 @@ window.centroid_scale_slider.setValue(70)
 window._load_display_config()
 assert window.centroid_scale_slider.value() == window.centroid_view.scale_percent == 50
 window.centroid_scale_slider.setValue(70)
-assert not graphs.findChildren(QtWidgets.QSpinBox)
-assert not graphs.findChildren(QtWidgets.QComboBox)
+assert all(window.slide_test.isAncestorOf(widget) for widget in graphs.findChildren(QtWidgets.QSpinBox))
+assert [widget for widget in graphs.findChildren(QtWidgets.QComboBox) if not window.slide_test.isAncestorOf(widget)] == [window.waveform_source, window.host_observation_channel]
 assert window.control_tabs.isAncestorOf(window.port_combo)
 assert window.control_tabs.isAncestorOf(window.history_input)
 assert window.control_tabs.isAncestorOf(window.nsub_input)
@@ -305,9 +309,13 @@ class Reader:
     def send_output_mode(self,*args): return True
 reader=Reader(); window.reader=reader; window._set_connected(True)
 window.nsub_input.setValue(400);window.tx_clk_div_input.setValue(120);window.ref_cdac_input.setValue(15)
+generation = window.host_state_machine.generation
 window.apply_parameters()
 assert reader.sent == [(400,120,15)]
+assert window.host_state_machine.generation > generation
+generation = window.host_state_machine.generation
 window.on_matrix_config_status(dict(pending=False,result=0,actual_nsub=400,actual_tx_clk_div=120,actual_ref_cdac=15))
+assert window.host_state_machine.generation > generation
 channels=[dict(channel=i,configured_nsub=400,hardware_nsub=400,configured_tx_clk_div=120,hardware_tx_clk_div=120,
                configured_ref_cdac=15,hardware_ref_cdac=15,max_raw_count=60000) for i in range(20)]
 window.on_capsense_channel_config(dict(channels=channels,read_ok=True))
@@ -352,7 +360,8 @@ while window.isVisible() and time.monotonic() < deadline:
     app.processEvents(); time.sleep(.01)
 assert not window.isVisible()
 assert not window.rolling_log.is_alive()
-assert window.rolling_log.status()['written'] == 1
+# 连接切换及三参数请求/同步各记录实验配置，关闭时必须一起落盘。
+assert window.rolling_log.status()['written'] == 5, window.rolling_log.status()
 assert not errors, errors
 assert not any(name.split('.')[0].startswith(('can','motor_','zdt_')) for name in sys.modules)
 print('Sensor-only monitor: no CAN/motor imports or startup port opens; 20-channel UI, parameters and snapshots passed')

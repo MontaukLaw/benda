@@ -1,17 +1,22 @@
-"""纯传感器窗口，只连接用户选择的串口；不加载电机、压力计或CAN模块。"""
+"""纯传感器窗口，启动自动连接COM3，支持手动选择串口；不加载电机、压力计或CAN模块。"""
 import json
 import math
+import time
 from pathlib import Path
 import pyqtgraph as pg
 from qt_compat import QtCore, QtGui, QtWidgets
-from config import BAUD_RATE, CHANNEL_COUNT, DEFAULT_HISTORY_LENGTH, GUI_REFRESH_HZ
+from config import BAUD_RATE, STARTUP_PORT, CHANNEL_COUNT, DEFAULT_HISTORY_LENGTH, GUI_REFRESH_HZ
 from config import MIN_HISTORY_LENGTH, MAX_HISTORY_LENGTH, OUTPUT_MODE_DEBUG, OUTPUT_MODE_RUN
 from channel_states import STATE_NAMES, IDLE_LIKE_STATES
 from data_buffer import AlgoDataBuffer, RX_FPS_STALE_SECONDS
 from centroid_view import CentroidView
+from centroid_filter import CHANNEL_GRID, sensor_geometry
 from touchpad_view import TouchpadPanel
 from watch_face_view import WatchFaceCanvas, WatchFacePanel
 from array_bar_view import ArrayBarView, ArrayBarPanel
+from host_state_machine import HostStateMachine, HOST_STATE_NAMES, HOST_STATE_COLORS
+from host_state_view import HostStatePanel, format_activation_reason
+from slide_test_view import SlideTestPanel
 from data_recorder import SerialDataRecorder
 from rolling_serial_log import RollingSerialLog
 from recent_data_export import RecentDataExportThread
@@ -25,7 +30,8 @@ CHANNEL_TABLE_COLUMNS = (
     ('hardware_raw_value', 'Raw Val'), ('baseline_plot', 'Base'), ('signal_plot', 'Sig'),
     ('baseline_value', 'Base Val'), ('signal_value', 'Sig Val'), ('fast_k_plot', 'Fast K'),
     ('fast_k_value', 'Fast K [%/s]'), ('slow_k_plot', 'Slow K'), ('slow_k_value', 'Slow K [%/s]'),
-    ('live_hardware_noise', '实时 Noise σ64'), ('state_background_select', 'Raw BG State CH'))
+    ('live_hardware_noise', '实时 Noise σ64'), ('state_background_select', 'Raw BG State CH'),
+    ('activation_reason', '最近激活原因'))
 CHANNEL_TABLE_COLUMN_INDEX = {key: i for i, (key, _) in enumerate(CHANNEL_TABLE_COLUMNS)}
 STATE_COLORS = {-1:'#49324e', 0:'#204f3b', 1:'#764821', 2:'#245779', 3:'#535087',
                 4:'#7c394b', 5:'#795020', 6:'#395c22', 7:'#216164', 8:'#5d5267'}
@@ -52,6 +58,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_port = self.current_device_info = None
         self.channel_count = CHANNEL_COUNT
         self.data_buffer = AlgoDataBuffer(DEFAULT_HISTORY_LENGTH)
+        self.host_state_machine = HostStateMachine(history_length=DEFAULT_HISTORY_LENGTH)
         self.data_recorder = SerialDataRecorder()
         self.rolling_log = RollingSerialLog()
         self._last_snapshot_version = -1
@@ -88,6 +95,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1700, 1000)
         self.setWindowTitle('20通道传感器监控 · V21')
         QtWidgets.QApplication.instance().installEventFilter(self)
+        # 等界面初始化完成后连接；首次成功前允许设备稍晚插入或释放端口。
+        self._startup_connect_pending = True
+        self._startup_connect_timer = QtCore.QTimer(self)
+        self._startup_connect_timer.setSingleShot(True)
+        self._startup_connect_timer.timeout.connect(self._try_startup_connection)
+        self._startup_connect_timer.start(0)
 
     def eventFilter(self, watched, event):
         if (event.type() == QtCore.QEvent.Type.KeyPress and event.key() == QtCore.Qt.Key.Key_Escape
@@ -157,6 +170,22 @@ class MainWindow(QtWidgets.QMainWindow):
         graph_layout = QtWidgets.QVBoxLayout(graphs)
         graph_layout.setContentsMargins(0,0,0,0)
         settings = QtWidgets.QHBoxLayout()
+        source_row = QtWidgets.QHBoxLayout()
+        graph_layout.addLayout(source_row)
+        self.waveform_source = QtWidgets.QComboBox()
+        self.waveform_source.addItem('固件上报', 'firmware')
+        self.waveform_source.addItem('上位机基线实验', 'host')
+        source_row.addWidget(QtWidgets.QLabel('波形来源'))
+        source_row.addWidget(self.waveform_source)
+        self.host_observation_label = QtWidgets.QLabel('实验观察通道')
+        self.host_observation_channel = QtWidgets.QComboBox()
+        for channel in range(CHANNEL_COUNT):
+            self.host_observation_channel.addItem(f'CH{channel}', channel)
+        source_row.addWidget(self.host_observation_label)
+        source_row.addWidget(self.host_observation_channel)
+        self.host_observation_label.hide()
+        self.host_observation_channel.hide()
+        source_row.addStretch(1)
         settings.addWidget(QtWidgets.QLabel('显示帧数'))
         self.history_input = self._spin(MIN_HISTORY_LENGTH, MAX_HISTORY_LENGTH, DEFAULT_HISTORY_LENGTH)
         self.history_input.valueChanged.connect(self._history_changed)
@@ -180,6 +209,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.raw_plot, self.signal_plot, self.k_plot = (self.plots[k] for k in ('raw','signal','k'))
         self.signal_plot.setXLink(self.raw_plot)
         self.k_plot.setXLink(self.raw_plot)
+        self.host_state_plot = pg.PlotWidget(title='上位机实验状态 · 所选背景通道', background='#080d13')
+        self.host_state_plot.setLabel('bottom', '采样帧')
+        self.host_state_plot.getAxis('left').setTicks([list(HOST_STATE_NAMES.items())])
+        self.host_state_plot.setYRange(-2.5, 3.5)
+        self.host_state_plot.setXLink(self.raw_plot)
+        self.host_state_curve = self.host_state_plot.plot(pen=pg.mkPen('#63d8ef', width=2), stepMode='left')
+        graph_layout.addWidget(self.host_state_plot, 1)
+        self.host_state_plot.hide()
         self.curves = {key: [] for key in PLOT_COLUMNS.values()}
         for i in range(CHANNEL_COUNT):
             color = pg.intColor(i, hues=CHANNEL_COUNT, values=1, maxValue=240, minValue=160)
@@ -258,7 +295,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         monitor_layout.addWidget(self.table)
         self.plot_checkboxes = {key: [] for key in self.curves}
-        self.value_labels = {key: [] for key in ('state','hardware_raw_value','baseline_value','signal_value','fast_k_value','slow_k_value','live_hardware_noise')}
+        self.value_labels = {key: [] for key in ('state','hardware_raw_value','baseline_value','signal_value','fast_k_value','slow_k_value','live_hardware_noise','activation_reason')}
         self.state_background_buttons = {}
         self.state_background_button_group = QtWidgets.QButtonGroup(self)
         for i in range(CHANNEL_COUNT):
@@ -289,6 +326,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     label = QtWidgets.QLabel('--')
                     label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                    if key == 'activation_reason':
+                        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
+                        label.setMinimumWidth(225)
+                        label.setStyleSheet('padding-left:6px;')
                     self.value_labels[key].append(label)
                     self.table.setCellWidget(i,col,label)
         controls.addStretch(1)
@@ -346,8 +387,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.touchpad = TouchpadPanel(self._log_touchpad)
         self.plot_tabs.addTab(self.touchpad.canvas, '触摸板光标')
         self.control_tabs.addTab(self.touchpad, '触摸板')
-        for widget in (self.touchpad.sensitivity, self.touchpad.threshold, self.touchpad.cutoff):
+        for widget in self.touchpad.setting_inputs():
             widget.valueChanged.connect(self._schedule_save)
+        self.touchpad.source.currentIndexChanged.connect(self._schedule_save)
+        self.touchpad.position_decay_enabled.toggled.connect(self._schedule_save)
+        self.slide_test = SlideTestPanel(self.rolling_log, self._slide_test_context,
+                                        self._prepare_slide_test, self._cleanup_slide_test)
+        self.plot_tabs.addTab(self.slide_test, '滑动测试')
+        for widget in (self.slide_test.horizontal_count, self.slide_test.vertical_count,
+                       self.slide_test.slide_seconds, self.slide_test.prepare_seconds,
+                       self.slide_test.release_seconds, self.slide_test.horizontal_distance,
+                       self.slide_test.vertical_distance):
+            widget.valueChanged.connect(self._schedule_save)
+        self.slide_test.pressure.currentIndexChanged.connect(self._schedule_save)
+        self.slide_test.notes.textChanged.connect(self._schedule_save)
         self.watch_face = WatchFaceCanvas()
         self.watch_settings = WatchFacePanel(self.watch_face)
         self.plot_tabs.addTab(self.watch_face, '圆形表盘')
@@ -359,6 +412,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_tabs.addTab(self.array_bars, '3D柱状图')
         self.control_tabs.addTab(self.array_bar_settings, '柱状图设置')
         self.array_bar_settings.settings_changed.connect(self._schedule_save)
+        self.array_bar_settings.settings_changed.connect(self._sync_touchpad_raw_gains)
+        self.array_bar_settings.settings_changed.connect(self._refresh_array_bars)
+        self.host_state_settings = HostStatePanel(self.host_state_machine, self._save_host_state_parameters)
+        self.control_tabs.addTab(self.host_state_settings, '基线与状态机')
+        self.host_state_settings.reset_requested.connect(self._reset_host_state)
+        self.host_state_settings.waveform_requested.connect(self._show_host_waveforms)
+        self.host_state_settings.observation_changed.connect(self._select_host_observation)
+        self.host_observation_channel.currentIndexChanged.connect(self._select_host_observation)
+        self.waveform_source.currentIndexChanged.connect(self._waveform_source_changed)
         self.touchpad.motion_sample.connect(self.watch_face.sensor_sample)
         self.touchpad.system_mouse.toggled.connect(self._watch_mouse_changed)
         self.plot_tabs.currentChanged.connect(self._watch_tab_changed)
@@ -456,6 +518,120 @@ class MainWindow(QtWidgets.QMainWindow):
     def _log_touchpad(self, frame):
         if self._connected:
             self.rolling_log.submit('touchpad', port=self.current_port, frame=frame)
+
+    def _slide_test_context(self):
+        return dict(connected=self._connected, port=self.current_port,
+                    sample=self.data_buffer.latest_sensor_sample(),
+                    host_ready=all(c.state != -1 for c in self.host_state_machine.channels),
+                    host_generation=self.host_state_machine.generation,
+                    host_parameters=self.host_state_machine.parameters.settings(),
+                    raw_gains=self.host_state_machine.gains,
+                    touchpad=self.touchpad.settings(), tracking_enabled=self.touchpad.enabled_box.isChecked(),
+                    position_reference_ready=self.touchpad.tracker.position_reference is not None,
+                    hardware_signature=getattr(self, '_touchpad_config_signature', None),
+                    matrix_readback=getattr(self, '_last_matrix_readback', None),
+                    channel_readback=getattr(self, '_last_channel_readback', None),
+                    channel_grid=CHANNEL_GRID, sensor_geometry=sensor_geometry(),
+                    coordinate_unit='cell', delta_unit='pixel')
+
+    def _prepare_slide_test(self):
+        self._slide_tracking_was_enabled = self.touchpad.enabled_box.isChecked()
+        self.touchpad.stop_mouse()
+        self.touchpad.enabled_box.setChecked(True)
+
+    def _cleanup_slide_test(self):
+        if getattr(self, '_slide_tracking_was_enabled', True) is False:
+            self.touchpad.enabled_box.setChecked(False)
+        self._slide_tracking_was_enabled = True
+
+    def _sync_touchpad_raw_gains(self):
+        # 无论柱状图当前选择Signal还是Raw，触摸板始终使用保存的逐通道Raw增益。
+        self.touchpad.set_raw_gains(self.array_bar_settings.settings()['raw_gains'])
+        previous_gains = self.host_state_machine.gains
+        self.host_state_machine.set_gains(self.array_bar_settings.settings()['raw_gains'])
+        if previous_gains != self.host_state_machine.gains:
+            self._reset_host_state('Raw 增益已改变；请保持释放，重新初始化')
+
+    def _log_host_settings(self):
+        if self._connected:
+            self.rolling_log.submit('host_state_config', port=self.current_port,
+                                    frame=dict(parameters=self.host_state_machine.parameters.settings(),
+                                               raw_gains=self.host_state_machine.gains,
+                                               reason=self.host_state_machine.reason))
+
+    def _reset_host_state(self, reason='请保持释放，重新初始化'):
+        # 跳过重置前已到达 GUI 缓存的帧，初始化仅使用此后的 Raw。
+        samples = self.data_buffer.pointer_samples_after(0)
+        if samples:
+            self.host_state_machine.last_sequence = samples[-1]['sequence']
+        self.host_state_machine.reset(reason)
+        if self.touchpad.tracker.source in self.touchpad.tracker.HOST_SOURCES:
+            self.touchpad.invalidate(reason)
+        self.host_state_settings.refresh()
+        self._refresh_array_bars()
+        self._last_snapshot_version = -1
+        self._log_host_settings()
+
+    def _show_host_waveforms(self):
+        self.waveform_source.setCurrentIndex(1)
+        self._select_host_observation(self.host_observation_channel.currentData())
+        self.plot_tabs.setCurrentIndex(0)
+
+    def _refresh_array_bars(self, sample=None):
+        # 派生 Signal 仅附加到视图样本，不改写固件数据；必须与当前 Raw 同帧。
+        if sample is None:
+            sample = self.data_buffer.latest_sensor_sample()
+        if sample is not None:
+            engine = self.host_state_machine
+            values = None
+            message = engine.reason
+            if not sample['has_raw']:
+                message = '上位机计算 Signal需要Raw · 请在波形设置中选择Debug输出'
+            elif (engine.last_timestamp is not None
+                  and sample['sequence'] == engine.last_sequence
+                  and sample['sample_timestamp'] == engine.last_timestamp
+                  and sample['age_seconds'] <= engine.parameters.gap_seconds):
+                values = tuple(channel.signal for channel in engine.channels)
+            sample = dict(sample, host_signal=values, host_signal_message=message)
+        self.array_bars.set_sample(sample)
+
+    def _select_host_observation(self, channel):
+        # 统一观察选择；只修改显示，不改变通道算法、基线或采样历史。
+        for combo in (self.host_observation_channel, self.host_state_settings.observation_channel):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(channel)
+            combo.blockSignals(False)
+        if self.waveform_source.currentData() == 'host':
+            self.state_background_channel_combo.blockSignals(True)
+            self.state_background_channel_combo.setCurrentIndex(channel)
+            self.state_background_channel_combo.blockSignals(False)
+            self.state_background_buttons[channel].setChecked(True)
+            for key, boxes in self.plot_checkboxes.items():
+                for i, box in enumerate(boxes):
+                    box.blockSignals(True)
+                    box.setChecked(i == channel and key != 'slow')
+                    box.blockSignals(False)
+            self._curve_visibility_changed()
+        self._last_snapshot_version = -1
+        self._schedule_save()
+
+    def _waveform_source_changed(self, *_):
+        host = self.waveform_source.currentData() == 'host'
+        self.raw_plot.setTitle('实验 input / baseline · Raw × 增益 → 低通' if host else 'Raw / Baseline · 固件上报')
+        self.signal_plot.setTitle('实验 Signal（仅 activate）' if host else 'Signal · 固件上报')
+        self.k_plot.setTitle('实验压力变化速度 [%/s] · 仅 activate 显示' if host else 'Fast K / Slow K')
+        self.host_state_plot.setVisible(host)
+        self.host_observation_label.setVisible(host)
+        self.host_observation_channel.setVisible(host)
+        for key, title in (('state', '实验状态' if host else 'State'),
+                           ('hardware_raw_plot', 'Input' if host else 'Raw'),
+                           ('hardware_raw_value', 'Input Val' if host else 'Raw Val'),
+                           ('fast_k_plot', '压力速度' if host else 'Fast K'),
+                           ('fast_k_value', '速度 [%/s]' if host else 'Fast K [%/s]')):
+            self.table.horizontalHeaderItem(CHANNEL_TABLE_COLUMN_INDEX[key]).setText(title)
+        if host:
+            self._select_host_observation(self.host_observation_channel.currentData())
+        self._curve_visibility_changed()
 
     def _watch_tab_changed(self, *_):
         if self.plot_tabs.currentWidget() is self.watch_face:
@@ -559,7 +735,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.control_tabs.addTab(tab,'固件升级')
 
     def refresh_ports(self):
-        selected = self.port_combo.currentData() or 'COM4'
+        selected = self.port_combo.currentData() or STARTUP_PORT
         ports, _ = SerialPortScanner().list_ports()
         self.port_combo.clear()
         for name, description in ports:
@@ -568,7 +744,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if index >= 0:
             self.port_combo.setCurrentIndex(index)
 
+    def _cancel_startup_connection(self):
+        self._startup_connect_pending = False
+        self._startup_connect_timer.stop()
+
+    def _try_startup_connection(self):
+        if not self._startup_connect_pending or self._closing or self.dfu_thread is not None:
+            return
+        if self.reader is None:
+            self.refresh_ports()
+            index = self.port_combo.findData(STARTUP_PORT)
+            if index < 0:
+                self.status_label.setText(f'等待 {STARTUP_PORT} 出现，将自动连接（每 2 秒重试）')
+            else:
+                self.port_combo.setCurrentIndex(index)
+                self.status_label.setText(f'正在自动连接 {STARTUP_PORT}…')
+                self.connect_serial(STARTUP_PORT)
+        if self._startup_connect_pending:
+            self._startup_connect_timer.start(2000)
+
     def toggle_connection(self):
+        self._cancel_startup_connection()
         self.disconnect_serial() if self.reader is not None else self.connect_serial()
 
     def connect_serial(self, port=None):
@@ -595,8 +791,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if reader is not self.reader:
             return
         self._set_connected(connected)
-        self.status_label.setText(message)
+        if self._startup_connect_pending and not connected:
+            # 线程退出会再发Disconnected，保留前一个打开失败原因。
+            if message != 'Disconnected':
+                self.status_label.setText(f'自动连接 {STARTUP_PORT} 失败：{message}；2 秒后重试')
+        else:
+            self.status_label.setText(message)
         if connected:
+            self._cancel_startup_connection()
             QtCore.QTimer.singleShot(150,self.send_output_mode_command)
             QtCore.QTimer.singleShot(300,self.request_parameters)
 
@@ -607,6 +809,7 @@ class MainWindow(QtWidgets.QMainWindow):
         reader.deleteLater()
 
     def disconnect_serial(self):
+        self._cancel_startup_connection()
         self.param_timer.stop()
         if self.reader is not None:
             reader = self.reader
@@ -619,9 +822,14 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _set_connected(self, connected):
+        if not connected and hasattr(self, 'slide_test'):
+            self.slide_test.stop('串口断开')
         if bool(connected) != self._connected:
             self.touchpad.invalidate('连接已改变，请松手重新采集触摸板参考')
+            self._reset_host_state()
         self._connected = bool(connected)
+        if connected:
+            self._log_host_settings()
         self.connect_button.setText('Disconnect' if connected else 'Connect')
         for widget in (self.recal_button,self.mode_apply_button,self.params_apply_button,self.params_read_button):
             widget.setEnabled(connected and self.dfu_thread is None)
@@ -635,6 +843,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def recalibrate(self):
         if self.reader is not None and self.reader.send_recalibration():
             self.touchpad.invalidate('固件基线重新校准，请松手重新采集触摸板参考')
+            self._reset_host_state()
             self.status_label.setText('已请求全部通道重新校准基线，请保持释放')
 
     def on_device_info(self, frame):
@@ -661,6 +870,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self.reader.set_matrix_config(nsub,tx,ref):
             self.touchpad.invalidate('三参数已改变，请松手重新采集触摸板参考')
+            self._reset_host_state('三参数改变；请保持释放，重新初始化')
             self._requested_params = (nsub,tx,ref)
             self._params_dirty = False
             self._params_pending = True
@@ -680,6 +890,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reader.get_matrix_config()
 
     def on_matrix_config_status(self, frame):
+        self._last_matrix_readback = frame
         pending, result = bool(frame['pending']),int(frame['result'])
         nsub,tx,ref = (int(frame[key]) for key in ('actual_nsub','actual_tx_clk_div','actual_ref_cdac'))
         if not self._params_dirty and not pending:
@@ -691,16 +902,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._params_pending and not pending and (result != 0 or (nsub,tx,ref) == self._requested_params):
             self._params_pending = False
             self.param_timer.stop()
+            if result == 0:
+                self._reset_host_state('三参数已同步；请保持释放，重新初始化')
             if self.reader is not None:
                 self.reader.get_capsense_channel_config()
 
     def on_capsense_channel_config(self, frame):
+        self._last_channel_readback = frame
         channels = frame.get('channels',())
         signature = tuple((c.get('channel'), c.get('hardware_nsub'),
                            c.get('hardware_tx_clk_div'), c.get('hardware_ref_cdac')) for c in channels)
         previous_signature = getattr(self, '_touchpad_config_signature', None)
         if previous_signature is not None and signature != previous_signature:
             self.touchpad.invalidate('硬件参数已改变，请松手重新采集触摸板参考')
+            self._reset_host_state('硬件参数已改变；请保持释放，重新初始化')
         self._touchpad_config_signature = signature
         self.capsense_parameter_table.setRowCount(len(channels))
         mismatches = []
@@ -761,7 +976,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.curves[key][i].setVisible(visible)
                 if visible:
                     plot = self.raw_plot if key in ('raw','baseline') else self.signal_plot if key == 'signal' else self.k_plot
-                    plot.plotItem.legend.addItem(self.curves[key][i], f'CH{i} {key}')
+                    name = {'raw': 'input', 'fast': '压力速度'}.get(key, key) if self.waveform_source.currentData() == 'host' else key
+                    plot.plotItem.legend.addItem(self.curves[key][i], f'CH{i} {name}')
         self._last_snapshot_version = -1
         self._schedule_save()
 
@@ -769,11 +985,14 @@ class MainWindow(QtWidgets.QMainWindow):
         channel = self.state_background_channel_combo.currentData()
         if channel in getattr(self,'state_background_buttons',{}):
             self.state_background_buttons[channel].setChecked(True)
+        if self.waveform_source.currentData() == 'host' and hasattr(self, 'host_state_settings'):
+            self._select_host_observation(channel)
         self._last_snapshot_version = -1
         self._schedule_save()
 
     def _history_changed(self, value):
         self.data_buffer.set_sample_count(value)
+        self.host_state_machine.set_history_length(value)
         self._schedule_save()
 
     def auto_range(self):
@@ -793,7 +1012,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.raw_plot.addItem(region,ignoreBounds=True)
             self._state_regions.append(region)
         for region,(start,stop,state) in zip(self._state_regions,runs):
-            color = QtGui.QColor(STATE_COLORS.get(int(state),STATE_COLORS[-1]))
+            palette = HOST_STATE_COLORS if self.waveform_source.currentData() == 'host' else STATE_COLORS
+            color = QtGui.QColor(palette.get(int(state),palette[-1]))
             color.setAlpha(90)
             region.setBrush(pg.mkBrush(color))
             region.setRegion((start-.5,stop-.5))
@@ -801,16 +1021,37 @@ class MainWindow(QtWidgets.QMainWindow):
             self.raw_plot.removeItem(self._state_regions.pop())
 
     def refresh_plots(self):
-        self.touchpad.process_samples(self.data_buffer.pointer_samples_after(self.touchpad.last_sequence))
+        host_touchpad = self.touchpad.tracker.source in self.touchpad.tracker.HOST_SOURCES
+        touchpad_samples = []
+        sequence = min(self.host_state_machine.last_sequence, self.touchpad.last_sequence) if host_touchpad else self.host_state_machine.last_sequence
+        for pending in self.data_buffer.pointer_samples_after(sequence):
+            frame = self.host_state_machine.feed(pending)
+            if frame is not None and self._connected:
+                self.rolling_log.submit('host_state_machine', port=self.current_port, frame=frame)
+            if host_touchpad and pending['sequence'] > self.touchpad.last_sequence:
+                # 必须复制每一采样的派生 Signal，不能用最后一帧结果驱动整个 GUI 批次。
+                touchpad_samples.append(dict(pending, host_signal=tuple(frame['signal']) if frame else None,
+                    host_input_val=tuple(frame['input_val']) if frame else None,
+                    host_baseline=tuple(frame['baseline']) if frame else None,
+                    host_state=tuple(frame['state']) if frame else None,
+                    host_generation=self.host_state_machine.generation,
+                    host_ready=bool(frame and all(state != -1 for state in frame['state'])),
+                    host_message=self.host_state_machine.reason))
+        self.host_state_machine.expire(time.perf_counter())
+        self.touchpad.process_samples(touchpad_samples if host_touchpad else
+                                     self.data_buffer.pointer_samples_after(self.touchpad.last_sequence))
+        self.host_state_settings.refresh()
         raw,base,sig,fast,slow,states,histories,fps,frames,count,channels,_,_,version = self.data_buffer.snapshot()
         sample = self.data_buffer.latest_sensor_sample()
         self._refresh_centroid(sample)
-        self.array_bars.set_sample(sample)
+        self._refresh_array_bars(sample)
         temperature = '--'
         if sample and sample['die_temperature_celsius'] is not None and (sample['die_temperature_age_seconds'] or 0) < 5:
             temperature = f"{sample['die_temperature_celsius']:.1f} °C"
         mode = 'Debug' if sample and sample['has_raw'] else 'Run · 诊断未上传' if sample else '等待数据'
         self.live_status.setText(f'{self.current_port or "未连接"} · {channels}通道 · RX {fps:.1f} FPS · {frames}帧 · {mode} · 温度 {temperature}')
+        host = self.waveform_source.currentData() == 'host'
+        version = (version, self.host_state_machine.version, host)
         if version == self._last_snapshot_version:
             return
         self._last_snapshot_version = version
@@ -819,6 +1060,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._row_visibility_changed()
             self._curve_visibility_changed()
         values = {'raw':raw,'baseline':base,'signal':sig,'fast':fast,'slow':slow}
+        names, palette = STATE_NAMES, STATE_COLORS
+        if host:
+            values = self.host_state_machine.snapshot()
+            raw, base, sig, fast, slow = (values[k] for k in ('raw', 'baseline', 'signal', 'fast', 'slow'))
+            histories = values['state']
+            states = [c.state for c in self.host_state_machine.channels]
+            count = len(raw[0])
+            names, palette = HOST_STATE_NAMES, HOST_STATE_COLORS
         x = list(range(count))
         for key,curves in self.curves.items():
             for i in range(self.channel_count):
@@ -827,17 +1076,27 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(self.channel_count):
             state = int(states[i])
             label = self.value_labels['state'][i]
-            label.setText(STATE_NAMES.get(state,f'未知 {state}'))
-            label.setStyleSheet(f'background:{STATE_COLORS.get(state,STATE_COLORS[-1])};border-radius:3px;padding:4px;')
+            label.setText(names.get(state,f'未知 {state}'))
+            label.setStyleSheet(f'background:{palette.get(state,palette[-1])};border-radius:3px;padding:4px;')
             for key,data,decimals in (('hardware_raw_value',raw,0),('baseline_value',base,0),('signal_value',sig,0),('fast_k_value',fast,2),('slow_k_value',slow,2)):
-                value = data[i][-1]
+                value = data[i][-1] if data[i] else math.nan
                 text = f'{value:.{decimals}f}' if math.isfinite(value) else '--'
-                if key == 'slow_k_value' and state in IDLE_LIKE_STATES:
+                if key == 'slow_k_value' and (host or state in IDLE_LIKE_STATES):
                     text = '-- 未计算'
                 self.value_labels[key][i].setText(text)
+            reason_label = self.value_labels['activation_reason'][i]
+            if host:
+                text, detail = format_activation_reason(self.host_state_machine.channels[i].last_activation)
+            else:
+                text, detail = '--', '固件协议未上报激活原因；切到上位机基线实验可查看实验模型的最近激活原因。'
+            reason_label.setText(text)
+            reason_label.setToolTip(detail)
         channel = self.state_background_channel_combo.currentData()
         if channel < len(histories):
             self._draw_state_background(histories[channel])
+            if host:
+                self.host_state_plot.setTitle(f'上位机实验状态 · CH{channel}')
+                self.host_state_curve.setData(x, histories[channel])
 
     def export_recent(self, minutes):
         if self._recent_export_worker is not None:
@@ -918,11 +1177,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._loading:
             self._save_timer.start()
 
-    def save_display_config(self):
+    def _save_host_state_parameters(self, parameters):
+        # 先原子保存候选参数，成功后由实验页应用；写入失败时保留原运行参数。
+        saved = self.save_display_config(host_parameters=parameters.settings())
+        if saved:
+            self.status_label.setText('实验参数已保存；请保持释放完成初始化。')
+        return saved, str(self._config_path.resolve()) if saved else self.status_label.text()
+
+    def save_display_config(self, *, host_parameters=None):
+        self._save_timer.stop()
         config = {'history':self.history_input.value(),'background':self.state_background_channel_combo.currentData(),
                   'touchpad':self.touchpad.settings(),
+                  'slide_test':self.slide_test.settings(),
                   'watch_face':self.watch_settings.settings(),
                   'array_bars':self.array_bar_settings.settings(),
+                  'host_state_machine':self.host_state_settings.settings() if host_parameters is None else host_parameters,
+                  'waveform_source':self.waveform_source.currentData(),
+                  'host_observation_channel':self.host_observation_channel.currentData(),
                   'centroid_smoothing':self.centroid_smoothing_checkbox.isChecked(),
                   'centroid_local_2x2':self.centroid_local_2x2_checkbox.isChecked(),
                   'centroid_raw':self.centroid_raw_checkbox.isChecked(),
@@ -945,8 +1216,12 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             config = json.loads(self._config_path.read_text(encoding='utf-8'))
             self.touchpad.load_settings(config.get('touchpad', {}))
+            self.slide_test.load_settings(config.get('slide_test', {}))
             self.watch_settings.load_settings(config.get('watch_face', {}))
             self.array_bar_settings.load_settings(config.get('array_bars', {}))
+            self._sync_touchpad_raw_gains()
+            self.host_state_settings.load_settings(config.get('host_state_machine', {}))
+            self.waveform_source.setCurrentIndex(1 if config.get('waveform_source') == 'host' else 0)
             self._centroid_signal_threshold = max(0,min(65535,int(config.get('centroid_signal_threshold',100))))
             self.centroid_threshold_input.setValue(self._centroid_signal_threshold)
             self.centroid_view.position_filter.set_signal_threshold(self._centroid_signal_threshold)
@@ -963,18 +1238,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     if key in buttons and isinstance(checked,bool):
                         buttons[key].setChecked(checked)
             order = config.get('order',[])
-            if len(order) == len(self.column_order) and set(order) == set(self.column_order):
-                self.column_order = order
+            if (isinstance(order, list) and len(order) == len(set(order))
+                    and set(order) in (set(self.column_order), set(self.column_order) - {'activation_reason'})):
+                # 兼容增加诊断列前的配置，保留用户已有列顺序，把新列追加到最右侧。
+                self.column_order = order + [key for key in self.column_order if key not in order]
                 self._apply_column_order()
             for key,values in config.get('curves',{}).items():
                 if key in self.plot_checkboxes:
                     for box,checked in zip(self.plot_checkboxes[key],values):
                         if isinstance(checked,bool):
                             box.setChecked(checked)
+            self._select_host_observation(max(0,min(19,int(config.get('host_observation_channel', config.get('background',0))))))
         except (OSError,ValueError,TypeError,AttributeError):
             pass
 
     def closeEvent(self, event):
+        self.slide_test.stop('关闭窗口')
         self.touchpad.stop_mouse()
         self.watch_face.cancel_gesture()
         if self.dfu_thread is not None:
@@ -991,7 +1270,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._closing = True
         self.rolling_log.request_close()
         if self.rolling_log.is_alive():
-            self.status_label.setText('正在后台补写串口日志，完成后自动关闭……')
+            self.status_label.setText('正在保存滑动测试与串口日志，完成后自动关闭……')
             event.ignore()
             QtCore.QTimer.singleShot(100, self.close)
             return
@@ -999,6 +1278,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if log_status['error']:
             QtWidgets.QMessageBox.warning(self, '日志写入失败',
                 f"{log_status['error']}\n仍有 {log_status['queued'] + log_status['pending']} 条日志未保存。")
+        if self.slide_test.capture is not None:
+            result = self.slide_test.capture.status()
+            if result['error']:
+                QtWidgets.QMessageBox.warning(self, '滑动测试保存失败',
+                    f"{result['error']}\n已写入文件保留于：{result['directory']}")
         self.log_timer.stop()
         self.refresh_timer.stop()
         self._save_timer.stop()

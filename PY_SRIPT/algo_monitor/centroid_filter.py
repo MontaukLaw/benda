@@ -20,8 +20,39 @@ DISAPPEAR_HOLD_SECONDS = 0.1
 
 # 通道按列编号；候选区域必须是空间相邻的两行两列。
 CHANNEL_GRID = tuple(tuple(row + 4 * col for col in range(5)) for row in range(4))
+# 实际传感器中心等间距8毫米，直径5毫米；毫米原点设在CH0中心。
+SENSOR_PITCH_MM = 8.0
+SENSOR_DIAMETER_MM = 5.0
+
+
+def sensor_geometry():
+    return dict(rows=len(CHANNEL_GRID), columns=len(CHANNEL_GRID[0]),
+                pitch_mm=SENSOR_PITCH_MM, diameter_mm=SENSOR_DIAMETER_MM,
+                center_span_mm=[4*SENSOR_PITCH_MM,3*SENSOR_PITCH_MM],
+                outer_span_mm=[4*SENSOR_PITCH_MM+SENSOR_DIAMETER_MM,3*SENSOR_PITCH_MM+SENSOR_DIAMETER_MM],
+                mm_origin='CH0 center', axis_direction='right/down')
+
+
+def centroid_mm(xy):
+    return None if xy is None else tuple((value - .5) * SENSOR_PITCH_MM for value in xy)
+
+
+CHANNEL_ADJACENT_PAIRS = (
+    tuple((CHANNEL_GRID[row][col], CHANNEL_GRID[row + 1][col])
+          for row in range(3) for col in range(5))
+    + tuple((CHANNEL_GRID[row][col], CHANNEL_GRID[row][col + 1])
+            for row in range(4) for col in range(4))
+)
 CENTROID_BLOCKS = tuple((ch, ch + 1, ch + 4, ch + 5)
                         for col in range(4) for row in range(3) for ch in (4 * col + row,))
+
+
+def active_adjacent_pairs(states, active_state):
+    """只按消费到的状态检查上下左右相邻，不跨列首尾，也不算对角线。"""
+    if states is None or len(states) != 20:
+        return ()
+    return tuple((a, b) for a, b in CHANNEL_ADJACENT_PAIRS
+                 if states[a] == active_state and states[b] == active_state)
 
 
 def _local_centroid(weights, previous_channels=()):

@@ -32,8 +32,45 @@ class RollingSerialLog:
         self._last_write = None
         self._path = None
         self._segment = self._size = 0
+        self._capture = None
+        self._capture_drop_start = 0
+        self._capture_workers = []
+        self._capture_handles = []
 
-    def submit(self, kind, *, port=None, data=None, frame=None, message=None):
+    def start_capture(self, directory, context):
+        from slide_test_capture import SlideTestCapture
+        with self._condition:
+            if self._closing or self._capture is not None:
+                raise ValueError('日志已关闭或已有测试正在采集')
+            capture = SlideTestCapture(directory, context)
+            self._capture = capture
+            self._capture_drop_start = self._dropped
+            capture.log_drop_start = self._dropped
+            self._capture_handles = [c for c in self._capture_handles if not c.status()['done']]
+            self._capture_handles.append(capture)
+            self.submit('slide_test', frame=dict(event='start', context=context), _control=True)
+            return capture
+
+    def finish_capture(self, outcome='completed', reason=''):
+        with self._condition:
+            if self._capture is None:
+                return
+            self.submit('slide_test', frame=dict(event='finish', outcome=outcome, reason=reason,
+                        dropped_records=self._dropped - self._capture_drop_start), _control=True)
+            self._capture = None
+
+    def _finish_capture_in_background(self, capture, outcome, reason, dropped):
+        if not capture.begin_finish():
+            return
+        # ZIP压缩单独运行，避免试验结束时阻塞持续串口日志。
+        worker = threading.Thread(target=capture.finish, args=(outcome, reason, dropped),
+                                  name='slide-test-archive', daemon=True)
+        with self._condition:
+            self._capture_workers = [w for w in self._capture_workers if w.is_alive()]
+            self._capture_workers.append(worker)
+            worker.start()
+
+    def submit(self, kind, *, port=None, data=None, frame=None, message=None, _control=False):
         # 帧来自解析器，交给日志后不再修改；原始字节在生产者处转成不可变对象。
         with self._condition:
             if self._closing:
@@ -41,7 +78,7 @@ class RollingSerialLog:
             sequence = self._sequence
             self._sequence += 1
             cost = len(data) + 1024 if data is not None else 16384 if frame is not None else 1024
-            if len(self._queue) >= self.queue_limit or self._queued_bytes + cost > self.queue_bytes:
+            if not _control and (len(self._queue) >= self.queue_limit or self._queued_bytes + cost > self.queue_bytes):
                 self._dropped += 1
                 return False
             record = dict(kind=kind, sequence=sequence, time_ns=time.time_ns(),
@@ -52,6 +89,8 @@ class RollingSerialLog:
                 record['frame'] = frame
             if message is not None:
                 record['message'] = message
+            if self._capture is not None:
+                record['_capture'] = self._capture
             self._queue.append((record, cost))
             self._queued_bytes += cost
             if self._thread is None:
@@ -70,15 +109,23 @@ class RollingSerialLog:
 
     def request_close(self):
         with self._condition:
+            self.finish_capture('aborted', '程序关闭')
             self._closing = True
             self._condition.notify_all()
 
     def is_alive(self):
-        return self._thread is not None and self._thread.is_alive()
+        with self._condition:
+            return (self._thread is not None and self._thread.is_alive()
+                    or any(worker.is_alive() for worker in self._capture_workers))
 
     def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
         if self._thread is not None:
             self._thread.join(timeout)
+        with self._condition:
+            workers = list(self._capture_workers)
+        for worker in workers:
+            worker.join(None if deadline is None else max(0, deadline - time.monotonic()))
         return not self.is_alive()
 
     @staticmethod
@@ -137,7 +184,15 @@ class RollingSerialLog:
                 empty = not self._queue
                 drops = self._dropped
             if record is not None:
-                batch.extend(self._encode(record))
+                capture = record.pop('_capture', None)
+                encoded = self._encode(record)
+                batch.extend(encoded)
+                if capture is not None:
+                    # 使用相同编码与顺序归档；无需重复解析或阻塞串口/GUI生产者。
+                    capture.write(encoded, record)
+                    if record['kind'] == 'slide_test' and record['frame'].get('event') == 'finish':
+                        f = record['frame']
+                        self._finish_capture_in_background(capture, f['outcome'], f['reason'], f['dropped_records'])
                 count += 1
             due = time.monotonic() >= deadline or len(batch) >= self.batch_bytes or (closing and empty)
             if due and drops != reported_drops:
@@ -165,6 +220,12 @@ class RollingSerialLog:
                     with self._condition:
                         self._error = str(exc)
                     if closing:
+                        # 主日志最终写入失败时，仍独立封存已采集的试验数据，并标明未消费队列。
+                        with self._condition:
+                            for capture in self._capture_handles:
+                                lost = sum(r.get('_capture') is capture for r, _ in self._queue)
+                                self._finish_capture_in_background(capture, 'aborted',
+                                    '串口日志写入失败：' + str(exc), self._dropped - capture.log_drop_start + lost)
                         return
                     # 写盘异常时保留本批、限制队列，避免占用无限内存或忙循环。
                     with self._condition:

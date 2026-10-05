@@ -217,3 +217,16 @@ PY_SRIPT/algo_monitor/long_duration_creep_test_config.json
 
 # Local source snapshot used only by the FLOATING delay comparison
 /analysis_outputs/floating_delay_20260920/before.c
+
+# 本次扫描超过50 MB的文件（Git忽略规则按路径匹配，不能按大小自动匹配）
+# 以上目录/数据规则继续覆盖新采集文件；下面保留已确认的大文件清单。
+/analysis_outputs/floating_thresholds_20260915_171103/control_windows.csv
+/analysis_outputs/floating_thresholds_20260915_171205/control_windows.csv
+/PY_SRIPT/algo_monitor/.venv-build-local/Lib/site-packages/cv2/cv2.pyd
+/PY_SRIPT/algo_monitor/dist/algo_monitor.zip
+/PY_SRIPT/algo_monitor/long_duration_creep_tests/creep_20260914_232355_787_acb48c2f/raw_data_part_001.sqlite3
+/PY_SRIPT/algo_monitor/long_duration_creep_tests/creep_20260915_105303_502_8a447fec/raw_data_part_001.sqlite3
+/PY_SRIPT/algo_monitor/long_duration_creep_tests/creep_20260915_122904_016_3dc6c4ea/raw_data_part_001.sqlite3
+/PY_SRIPT/algo_monitor/recordings/slide_tests/slide_test_20261005_135838_417747_c2ef09c9/records.jsonl
+/PY_SRIPT/algo_monitor/recordings/slide_tests/slide_test_20261005_144103_697471_81ebcbd7/records.jsonl
+/PY_SRIPT/algo_monitor/recordings/slide_tests/slide_test_20261005_144515_537696_d7c560e5/records.jsonl

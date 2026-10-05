@@ -82,6 +82,7 @@ assert canvas.model.phase=='idle' and canvas.model.nearest()['distance']<1e-6
 # 按真实触摸板算法发出事件，保证触摸板灵敏度不会叠加到表盘速度上。
 canvas.model=WatchFaceModel()
 panel=window.touchpad
+panel.source.setCurrentIndex(panel.source.findData('raw_reference'))
 panel.enabled_box.setChecked(True)
 base=[8000+i*123 for i in range(20)]
 panel.tracker.reference=tuple(base);panel.tracker.noise=(2.,)*20
@@ -106,6 +107,53 @@ offset=tuple(canvas.model.offset)
 window.touchpad.motion_sample.emit(dict(timestamp=clock+.03,contact=True,dx=0.,dy=0.,cancel=False))
 assert canvas.model.phase=='drag' and tuple(canvas.model.offset)==offset
 sensor(None,valid=False)
+assert canvas.model.phase=='idle' and canvas.owner is None
+
+# 上位机相邻激活条件失效应结束拖动并吸附，连续释放帧不能打断吸附动画。
+canvas.model=WatchFaceModel()
+panel.source.setCurrentIndex(panel.source.findData('host_signal'))
+motion_events=[]
+panel.motion_sample.connect(motion_events.append)
+def host_sensor(x):
+    global clock,sequence
+    clock+=.01;sequence+=1
+    values=[0.]*20
+    if x is None:
+        values[5]=1000.
+    else:
+        values[5]=1000*(2.5-x);values[9]=1000*(x-1.5)
+    sample=dict(sequence=sequence,sample_timestamp=clock,channel_count=20,has_raw=True,
+                raw=base,host_signal=values,host_state=[1 if v>0 else 0 for v in values],
+                host_generation=1,host_ready=True)
+    panel.process_samples([sample],now=clock)
+for _ in range(10):host_sensor(2.)
+for i in range(40):host_sensor(2.+.2*(i+1)/40)
+assert canvas.owner=='sensor' and canvas.model.phase=='drag'
+assert canvas.model.nearest()['distance']>5
+host_sensor(None)
+assert motion_events[-1]['cancel'] and motion_events[-1].get('snap_on_cancel')
+assert canvas.owner is None and canvas.model.phase=='snap'
+snap_start=canvas.model._start
+snap_target=canvas.model.selected
+for _ in range(15):host_sensor(None)
+assert canvas.model.phase=='snap' and canvas.model._start==snap_start
+assert canvas.model.selected==snap_target
+canvas.animate(snap_start+canvas.model.settings['snap_duration_ms']/1000+.001)
+assert canvas.model.phase=='idle' and canvas.model.nearest()['distance']<1e-6
+
+# 再次落指可接管未完成的吸附；位置锚定帧不重放上一次拖动。
+canvas.model=WatchFaceModel()
+panel.tracker.end_contact()
+for _ in range(10):host_sensor(2.)
+for i in range(40):host_sensor(2.+.2*(i+1)/40)
+host_sensor(None)
+assert canvas.model.phase=='snap'
+offset=tuple(canvas.model.offset)
+for _ in range(8):host_sensor(2.)
+assert canvas.owner=='sensor' and canvas.model.phase=='drag'
+assert math.dist(offset,canvas.model.offset)<2
+sensor(None,valid=False)
+assert motion_events[-1]['cancel'] and not motion_events[-1].get('snap_on_cancel')
 assert canvas.model.phase=='idle' and canvas.owner is None
 
 # 系统鼠标开关与表盘输入不叠加；切换页面中断未完成手势。

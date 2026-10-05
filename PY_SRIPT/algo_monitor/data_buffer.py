@@ -64,6 +64,7 @@ class AlgoDataBuffer:
         self._frame_times = deque(maxlen=300)
         self._latest_sensor_frame_time = None
         self._latest_sensor_has_raw = False
+        self._latest_sensor_raw_only = False
         self._total_frames = 0
         # 保存短队列供相对位移逐帧消费，避免GUI刷新只取末帧而漏掉轨迹。
         self._pointer_samples = deque(maxlen=512)
@@ -125,6 +126,8 @@ class AlgoDataBuffer:
             self._frame_times.append(now)
             self._latest_sensor_frame_time = now
             self._latest_sensor_has_raw = frame["type"] == "debug"
+            # 保留Raw帧的真实来源标记，触摸板不能把补零Signal当成实际测量。
+            self._latest_sensor_raw_only = self._latest_sensor_has_raw and bool(frame.get('raw_only', False))
             self._raw_response.feed(frame.get("raw") if self._latest_sensor_has_raw else None, frame["device"], now)
 
             if frame["type"] == "debug":
@@ -154,6 +157,7 @@ class AlgoDataBuffer:
             self._pointer_samples.append(dict(
                 sequence=self._total_frames, sample_timestamp=now,
                 has_raw=self._latest_sensor_has_raw, channel_count=channel_count,
+                raw_only=self._latest_sensor_raw_only,
                 raw=tuple(raw_values) if self._latest_sensor_has_raw else (),
                 signal=tuple(signal_values),
                 state=tuple(self._states) if self._latest_sensor_has_raw else ()))
@@ -246,6 +250,7 @@ class AlgoDataBuffer:
                     else max(0.0, time.perf_counter() - self._die_temperature_frame_time)
                 ),
                 "has_raw": self._latest_sensor_has_raw,
+                "raw_only": self._latest_sensor_raw_only,
                 "age_seconds": time.perf_counter() - self._latest_sensor_frame_time,
             }
 
