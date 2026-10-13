@@ -2,6 +2,7 @@
 import math
 
 from qt_compat import QtCore, QtGui, QtWidgets, Signal
+from font_scale import scaled_font_size
 from centroid_filter import CHANNEL_GRID
 from data_buffer import RX_FPS_STALE_SECONDS
 from raw_gain import RAW_GAIN_MAX, RAW_DISPLAY_MAX, normalize_raw_gains, apply_raw_gains
@@ -168,14 +169,15 @@ class ArrayBarView(QtWidgets.QWidget):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QtGui.QColor('#080d13'))
-        font = QtGui.QFont(self.font());font.setPixelSize(22);font.setBold(True)
+        font = QtGui.QFont(self.font());font.setPixelSize(scaled_font_size(self,22));font.setBold(True)
         painter.setFont(font);painter.setPen(QtGui.QColor('#dceaf5'))
         name = SOURCE_NAMES[self.settings['source']]
-        painter.drawText(QtCore.QRectF(16, 18, self.width()-32, 32), QtCore.Qt.AlignmentFlag.AlignCenter,
+        title_height = max(32,painter.fontMetrics().height()+4)
+        painter.drawText(QtCore.QRectF(16, 18, self.width()-32, title_height), QtCore.Qt.AlignmentFlag.AlignCenter,
                          f'4 × 5 三维柱状图 · {name}')
-        font.setPixelSize(12);font.setBold(False);painter.setFont(font)
+        font.setPixelSize(scaled_font_size(self,12));font.setBold(False);painter.setFont(font)
         painter.setPen(QtGui.QColor('#9bb7ca'))
-        painter.drawText(QtCore.QRectF(16, 53, self.width()-32, 24), QtCore.Qt.AlignmentFlag.AlignCenter,
+        painter.drawText(QtCore.QRectF(16, 18+title_height+3, self.width()-32, max(24,painter.fontMetrics().height()+4)), QtCore.Qt.AlignmentFlag.AlignCenter,
                          '柱高和颜色表示同一量程下的数值 · 按住左键拖动旋转')
         origin, scale = self.scene_geometry()
         project = lambda point: self.project(point, origin, scale)
@@ -214,27 +216,18 @@ class ArrayBarView(QtWidgets.QWidget):
             painter.drawPolygon(shape)
             self._hit_faces.append((shape, channel))
 
-        # 数字保留实际值；标签错开避免重叠，用引线标出所属柱体。
-        font.setPixelSize(max(9, min(12, round(scale*.16))));painter.setFont(font)
-        occupied = []
-        labels = []
-        for bar in sorted(bars, key=lambda bar:bar['height'], reverse=True):
+        # 标签始终位于柱顶上方5像素，允许重叠，不再避让或绘制引线。
+        font.setPixelSize(scaled_font_size(self,max(9, min(12, round(scale*.16)))));painter.setFont(font)
+        for bar in bars:
             anchor = project((bar['col']-2, bar['row']-1.5, bar['height']))
             text = f"CH{bar['channel']}"
             if self.settings['show_values'] and bar['value'] is not None:
                 text += f"\n{bar['value']:g}"
             height = 32 if '\n' in text else 20
-            rect = QtCore.QRectF(anchor.x()-29, anchor.y()-height-5, 58, height)
-            for shift in range(12):
-                candidate = rect.translated(0,-shift*(height+3))
-                if not any(candidate.adjusted(-2,-2,2,2).intersects(other) for other in occupied):
-                    rect = candidate
-                    break
-            occupied.append(rect)
-            labels.append((rect,anchor,text))
-        for rect,anchor,text in labels:
-            painter.setPen(QtGui.QPen(QtGui.QColor('#7993a8'),.8))
-            painter.drawLine(anchor,QtCore.QPointF(rect.center().x(),rect.bottom()))
+            lines = text.split('\n')
+            height = max(height, painter.fontMetrics().height()*len(lines)+4)
+            width = max(58, max(painter.fontMetrics().horizontalAdvance(line) for line in lines)+10)
+            rect = QtCore.QRectF(anchor.x()-width/2, anchor.y()-height-5, width, height)
             painter.fillRect(rect, QtGui.QColor(8,13,19,210))
             painter.setPen(QtGui.QColor('#edf5fb'))
             painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, text)
@@ -245,16 +238,20 @@ class ArrayBarView(QtWidgets.QWidget):
         for i in range(5):
             anchor = project((-2.7,2.2,self.MAX_HEIGHT*i/4))
             painter.drawLine(anchor,anchor+QtCore.QPointF(-5,0))
-            painter.drawText(QtCore.QRectF(anchor.x()-65,anchor.y()-10,55,20),
+            text = f'{self.height_limit()*i/4:g}'
+            width = max(55,painter.fontMetrics().horizontalAdvance(text)+4)
+            height = max(20,painter.fontMetrics().height()+4)
+            painter.drawText(QtCore.QRectF(anchor.x()-width-10,anchor.y()-height/2,width,height),
                              QtCore.Qt.AlignmentFlag.AlignRight|QtCore.Qt.AlignmentFlag.AlignVCenter,
-                             f'{self.height_limit()*i/4:g}')
+                             text)
         status = self._message
         if self.values is not None:
             clipped = sum(value > self.height_limit() for value in self.values)
             status += f' · {clipped}路超量程，柱高已裁剪' if clipped else ''
-        painter.drawText(QtCore.QRectF(16,self.height()-67,self.width()-32,28),QtCore.Qt.AlignmentFlag.AlignCenter,status)
+        line_height = max(28,painter.fontMetrics().height()+4)
+        painter.drawText(QtCore.QRectF(16,self.height()-10-line_height*2,self.width()-32,line_height),QtCore.Qt.AlignmentFlag.AlignCenter,status)
         painter.setPen(QtGui.QColor('#8297a9'))
-        painter.drawText(QtCore.QRectF(16,self.height()-38,self.width()-32,24),QtCore.Qt.AlignmentFlag.AlignCenter,
+        painter.drawText(QtCore.QRectF(16,self.height()-10-line_height,self.width()-32,line_height),QtCore.Qt.AlignmentFlag.AlignCenter,
                          f'高度范围 0—{self.height_limit():g} count · '+('自动量程' if self.settings['auto_range'] else '固定量程'))
 
 
@@ -280,7 +277,7 @@ class ArrayBarPanel(QtWidgets.QScrollArea):
         self.show_values = QtWidgets.QCheckBox('显示每路实际数值');self.show_values.setChecked(True)
         form.addRow(self.show_values)
         note = QtWidgets.QLabel('Signal为固件上报值；Raw Val按下表增益显示，包含各通道静态底值。\n'
-                               '上位机计算 Signal使用“基线与状态机”的输出，仅activate有信号，已含Raw增益，不再重复乘增益。需要完整20通道Raw采样，初始化时请保持释放。\n'
+                               '上位机计算 Signal使用“基线与状态机”的输出，可在该页切换低通前/后；低通前仅activate有信号，低通后释放时缓降。已含Raw增益，不再重复乘增益。需要完整20通道Raw采样，初始化时请保持释放。\n'
                                '数值超过高度上限时只裁剪柱高，可提高上限或使用自动量程。三种来源的高度上限分别保存，选择独立于波形来源。')
         note.setWordWrap(True);layout.addWidget(note)
         group = QtWidgets.QGroupBox('Raw Val逐通道增益');gain_layout = QtWidgets.QVBoxLayout(group);layout.addWidget(group)

@@ -1,6 +1,7 @@
 """纯传感器窗口，启动自动连接COM3，支持手动选择串口；不加载电机、压力计或CAN模块。"""
 import json
 import math
+import re
 import time
 from pathlib import Path
 import pyqtgraph as pg
@@ -14,6 +15,8 @@ from centroid_filter import CHANNEL_GRID, sensor_geometry
 from touchpad_view import TouchpadPanel
 from watch_face_view import WatchFaceCanvas, WatchFacePanel
 from array_bar_view import ArrayBarView, ArrayBarPanel
+from raw_gain_calibration_view import RawGainCalibrationPanel
+from raw_gain import RAW_GAIN_MAX
 from host_state_machine import HostStateMachine, HOST_STATE_NAMES, HOST_STATE_COLORS
 from host_state_view import HostStatePanel, format_activation_reason
 from slide_test_view import SlideTestPanel
@@ -24,6 +27,7 @@ from serial_reader import SerialReaderThread
 from serial_ports import SerialPortScanner
 from dfu_upgrade import DfuUpgradeThread, parse_cyacd2, resolve_dfu_image_path
 from monitor_widgets import FlowLayout, ColumnToggleButton
+from font_scale import DEFAULT_FONT_PX, MIN_FONT_PX, MAX_FONT_PX
 
 CHANNEL_TABLE_COLUMNS = (
     ('channel', 'CH'), ('state', 'State'), ('hardware_raw_plot', 'Raw'),
@@ -70,6 +74,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._requested_params = None
         self._params_poll_remaining = 0
         self._loading = True
+        self._ui_font_px = DEFAULT_FONT_PX
         self._config_path = Path(__file__).with_name('sensor_display_config.json')
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -207,6 +212,23 @@ class MainWindow(QtWidgets.QMainWindow):
             graph_layout.addWidget(plot, 1)
             self.plots[key] = plot
         self.raw_plot, self.signal_plot, self.k_plot = (self.plots[k] for k in ('raw','signal','k'))
+        # 低通释放尾值可能衰减到浮点极小数；限制显示跨度，防止刻度间距下溢为零。
+        self.signal_plot.setLimits(minYRange=1.)
+        self.k_plot.setLimits(minYRange=.001)
+        self._speed_extrema_data = None
+        self.speed_extrema_lines = {}
+        for name, color, position, anchors in (
+                ('最大', '#ffcc78', .98, [(1, 0), (1, 0)]),
+                ('最小', '#63d8ef', .02, [(0, 1), (0, 1)])):
+            line = pg.InfiniteLine(angle=0, movable=False,
+                pen=pg.mkPen(color, width=1.5, style=QtCore.Qt.PenStyle.DashLine),
+                label=name, labelOpts=dict(position=position, anchors=anchors, color=color))
+            # 极值辅助线不参与自动量程，避免旧窗口的极值反过来拉伸新曲线。
+            self.k_plot.addItem(line, ignoreBounds=True)
+            line.setZValue(20)
+            line.hide()
+            self.speed_extrema_lines[name] = line
+        self.k_plot.getViewBox().sigXRangeChanged.connect(self._update_speed_extrema)
         self.signal_plot.setXLink(self.raw_plot)
         self.k_plot.setXLink(self.raw_plot)
         self.host_state_plot = pg.PlotWidget(title='上位机实验状态 · 所选背景通道', background='#080d13')
@@ -419,6 +441,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.host_state_settings.reset_requested.connect(self._reset_host_state)
         self.host_state_settings.waveform_requested.connect(self._show_host_waveforms)
         self.host_state_settings.observation_changed.connect(self._select_host_observation)
+        self.host_state_settings.signal_display_changed.connect(self._signal_display_changed)
+        self.raw_gain_calibration = RawGainCalibrationPanel(
+            self._apply_calibrated_gains, self.data_buffer.latest_sensor_sample, self._calibration_context)
+        self.control_tabs.insertTab(1, self.raw_gain_calibration, '标定')
+        self.raw_gain_calibration.settings_changed.connect(self._schedule_save)
+        self.control_tabs.currentChanged.connect(self._calibration_tab_changed)
         self.host_observation_channel.currentIndexChanged.connect(self._select_host_observation)
         self.waveform_source.currentIndexChanged.connect(self._waveform_source_changed)
         self.touchpad.motion_sample.connect(self.watch_face.sensor_sample)
@@ -429,10 +457,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setWordWrap(True)
         root.addWidget(self.live_status)
         root.addWidget(self.status_label)
+        font_controls = QtWidgets.QHBoxLayout()
+        self.font_smaller_button = self._button('字体－', lambda: self._change_font_size(-1), font_controls)
+        self.font_larger_button = self._button('字体＋', lambda: self._change_font_size(1), font_controls)
+        self.font_size_label = QtWidgets.QLabel()
+        font_controls.addWidget(self.font_size_label)
+        font_controls.addStretch(1)
+        root.addLayout(font_controls)
         self._column_visibility_changed()
         self._row_visibility_changed()
         self._curve_visibility_changed()
-        self.setStyleSheet('''
+        self._base_style_sheet = '''
             QMainWindow, QWidget { background:#080d13; color:#d9e7f0; font-family:"Segoe UI","Microsoft YaHei"; font-size:13px; }
             QGroupBox { border:1px solid #33495a; border-radius:6px; margin-top:12px; padding-top:8px; }
             QGroupBox::title { subcontrol-origin:margin; left:10px; color:#63d8ef; }
@@ -448,7 +483,71 @@ class MainWindow(QtWidgets.QMainWindow):
             QRadioButton::indicator:checked { border:4px solid #52d2f3; background:#183a48; }
             QTabBar::tab { padding:8px 18px; background:#182b39; }
             QTabBar::tab:selected { background:#28536b; }
-        ''')
+        '''
+        self._apply_font_size(DEFAULT_FONT_PX)
+
+    def _change_font_size(self, step):
+        self._apply_font_size(self._ui_font_px + step)
+        self._schedule_save()
+
+    def _apply_font_size(self, size):
+        previous_size = self._ui_font_px
+        if isinstance(size, bool) or not isinstance(size, int):
+            size = DEFAULT_FONT_PX
+        self._ui_font_px = max(MIN_FONT_PX, min(MAX_FONT_PX, size))
+        self.setProperty('monitorFontPx', self._ui_font_px)
+        self.setStyleSheet(self._base_style_sheet.replace('font-size:13px', f'font-size:{self._ui_font_px}px'))
+        font = QtGui.QFont(self.font())
+        font.setPixelSize(self._ui_font_px)
+        self.setFont(font)
+        # 子页面强调字号保留相对大小，只替换字号，保留当前颜色和其他样式。
+        pattern = re.compile(r'(font-size\s*:\s*)(\d+)(px)', re.I)
+        for widget in self.findChildren(QtWidgets.QWidget):
+            style = widget.styleSheet()
+            matches = list(pattern.finditer(style))
+            if matches:
+                original = widget.property('monitorOriginalFontSizes')
+                if original is None or len(original) != len(matches):
+                    original = [int(match[2]) for match in matches]
+                    widget.setProperty('monitorOriginalFontSizes', original)
+                sizes = iter(original)
+                widget.setStyleSheet(pattern.sub(lambda match: f'{match[1]}{max(1,round(next(sizes)*self._ui_font_px/DEFAULT_FONT_PX))}{match[3]}', style))
+            widget.updateGeometry()
+            widget.update()
+        # 普通控件样式不会覆盖GraphicsItem的字体，波形标题、坐标轴和图例需单独更新。
+        for plot in (*self.plots.values(), self.host_state_plot):
+            plot.setTitle(plot.plotItem.titleLabel.text, size=f'{self._ui_font_px}px')
+            for name in ('left', 'bottom'):
+                axis = plot.getAxis(name)
+                axis.setStyle(tickFont=font)
+                axis.setLabel(text=axis.labelText, units=axis.labelUnits, unitPrefix=axis.labelUnitPrefix,
+                              **dict(axis.labelStyle, **{'font-size': f'{self._ui_font_px}px'}))
+            legend = plot.plotItem.legend
+            if legend is not None:
+                for _, label in legend.items:
+                    label.setText(label.text, size=f'{self._ui_font_px}px')
+                legend.updateSize()
+        for line in self.speed_extrema_lines.values():
+            line.label.setFont(font)
+        for table in self.findChildren(QtWidgets.QTableWidget):
+            heights = table.property('monitorOriginalRowHeights')
+            if heights is None or len(heights) != table.rowCount():
+                heights = [round(table.rowHeight(row)*DEFAULT_FONT_PX/previous_size) for row in range(table.rowCount())]
+                table.setProperty('monitorOriginalRowHeights', heights)
+            default_height = table.property('monitorOriginalDefaultRowHeight')
+            if default_height is None:
+                default_height = table.verticalHeader().defaultSectionSize()
+                table.setProperty('monitorOriginalDefaultRowHeight', default_height)
+            table.verticalHeader().setDefaultSectionSize(max(round(default_height*self._ui_font_px/DEFAULT_FONT_PX), table.fontMetrics().height()+10))
+            for row, height in enumerate(heights):
+                table.setRowHeight(row, max(round(height*self._ui_font_px/DEFAULT_FONT_PX), table.fontMetrics().height()+10))
+            if table.minimumHeight() == table.maximumHeight():
+                table.setFixedHeight(table.horizontalHeader().sizeHint().height()
+                                     + sum(table.rowHeight(row) for row in range(table.rowCount()))
+                                     + table.frameWidth()*2)
+        self.font_size_label.setText(f'字号：{self._ui_font_px} px')
+        self.font_smaller_button.setEnabled(self._ui_font_px > MIN_FONT_PX)
+        self.font_larger_button.setEnabled(self._ui_font_px < MAX_FONT_PX)
 
     def _build_parameters(self, controls):
         self.matrix_config_group, layout = self._group('三参数 · MatrixButtons0 全部20通道（仅RAM）', controls)
@@ -552,11 +651,43 @@ class MainWindow(QtWidgets.QMainWindow):
         if previous_gains != self.host_state_machine.gains:
             self._reset_host_state('Raw 增益已改变；请保持释放，重新初始化')
 
+    def _calibration_context(self):
+        channels=getattr(self, '_last_channel_readback', {}).get('channels', ())
+        limits=[65535]*20
+        for c in channels:
+            if c.get('channel') in range(20) and isinstance(c.get('max_raw_count'), (int,float)) and c['max_raw_count']>0:
+                limits[c['channel']]=min(65535,c['max_raw_count'])
+        return dict(port=self.current_port, device_info=self.current_device_info,
+                    hardware_signature=getattr(self, '_touchpad_config_signature', None),
+                    raw_limits=limits, parameters_pending=self._params_pending, connected=self._connected)
+
+    def _apply_calibrated_gains(self, gains):
+        # 先保存候选增益，再同步既有入口；保存失败时运行增益和参考不变。
+        if (not isinstance(gains, (list,tuple)) or len(gains)!=20
+                or any(not isinstance(g,(int,float)) or isinstance(g,bool) or not math.isfinite(g) or not 0<g<=RAW_GAIN_MAX for g in gains)):
+            return False, '标定增益无效，未应用。'
+        if not self._connected:
+            return False, '传感器未连接，未应用；请连接并核对历史标定环境。'
+        settings=self.array_bar_settings.settings()
+        settings['raw_gains']=list(gains)
+        previous=self.host_state_machine.gains
+        if not self.save_display_config(array_parameters=settings):
+            return False, self.status_label.text()
+        self.array_bar_settings.load_settings(settings)
+        self._sync_touchpad_raw_gains()
+        # 即使计算结果恰好与原增益相同，也重新建立空载参考。
+        if previous==self.host_state_machine.gains:
+            self._reset_host_state('标定增益已应用；请保持空载完成初始化')
+        self._refresh_array_bars()
+        self.status_label.setText('标定增益已保存并应用；请保持空载，等待上位机参考初始化。')
+        return True, '20通道增益已应用并保存。请继续保持空载，等待上位机基线和位置参考初始化。'
+
     def _log_host_settings(self):
         if self._connected:
             self.rolling_log.submit('host_state_config', port=self.current_port,
                                     frame=dict(parameters=self.host_state_machine.parameters.settings(),
                                                raw_gains=self.host_state_machine.gains,
+                                               signal_filtered_display=self.host_state_settings.signal_filtered_box.isChecked(),
                                                reason=self.host_state_machine.reason))
 
     def _reset_host_state(self, reason='请保持释放，重新初始化'):
@@ -565,6 +696,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if samples:
             self.host_state_machine.last_sequence = samples[-1]['sequence']
         self.host_state_machine.reset(reason)
+        self._clear_speed_extrema()
         if self.touchpad.tracker.source in self.touchpad.tracker.HOST_SOURCES:
             self.touchpad.invalidate(reason)
         self.host_state_settings.refresh()
@@ -591,12 +723,18 @@ class MainWindow(QtWidgets.QMainWindow):
                   and sample['sequence'] == engine.last_sequence
                   and sample['sample_timestamp'] == engine.last_timestamp
                   and sample['age_seconds'] <= engine.parameters.gap_seconds):
-                values = tuple(channel.signal for channel in engine.channels)
+                filtered = self.host_state_settings.signal_filtered_box.isChecked()
+                values = tuple(channel.signal_filtered if filtered else channel.signal for channel in engine.channels)
+                active = sum(channel.state == 1 for channel in engine.channels)
+                recovering = sum(channel.state in (2, 3) for channel in engine.channels)
+                message += f' · 激活{active}/20 · 恢复{recovering}/20'
+                message += (f' · 低通后 alpha={engine.parameters.signal_alpha:g}' if filtered else ' · 低通前')
             sample = dict(sample, host_signal=values, host_signal_message=message)
         self.array_bars.set_sample(sample)
 
     def _select_host_observation(self, channel):
         # 统一观察选择；只修改显示，不改变通道算法、基线或采样历史。
+        self._clear_speed_extrema()
         for combo in (self.host_observation_channel, self.host_state_settings.observation_channel):
             combo.blockSignals(True)
             combo.setCurrentIndex(channel)
@@ -617,10 +755,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _waveform_source_changed(self, *_):
         host = self.waveform_source.currentData() == 'host'
+        self._clear_speed_extrema()
         self.raw_plot.setTitle('实验 input / baseline · Raw × 增益 → 低通' if host else 'Raw / Baseline · 固件上报')
-        self.signal_plot.setTitle('实验 Signal（仅 activate）' if host else 'Signal · 固件上报')
-        self.k_plot.setTitle('实验压力变化速度 [%/s] · 仅 activate 显示' if host else 'Fast K / Slow K')
-        self.host_state_plot.setVisible(host)
+        self._update_signal_display_labels()
+        self.k_plot.setTitle('实验实时速度 [%/s] · 全状态 · 虚线为可见窗口极值' if host else 'Fast K / Slow K', size=f'{self._ui_font_px}px')
+        # 状态已在 Raw/input 图的背景中显示，独立状态图保持隐藏。
+        self.host_state_plot.hide()
         self.host_observation_label.setVisible(host)
         self.host_observation_channel.setVisible(host)
         for key, title in (('state', '实验状态' if host else 'State'),
@@ -633,6 +773,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self._select_host_observation(self.host_observation_channel.currentData())
         self._curve_visibility_changed()
 
+    def _update_signal_display_labels(self):
+        host = self.waveform_source.currentData() == 'host'
+        filtered = self.host_state_settings.signal_filtered_box.isChecked()
+        title = ('实验 Signal · 低通后（释放后缓降）' if filtered else '实验 Signal · 低通前（仅 activate）') if host else 'Signal · 固件上报'
+        self.signal_plot.setTitle(title, size=f'{self._ui_font_px}px')
+        self.table.horizontalHeaderItem(CHANNEL_TABLE_COLUMN_INDEX['signal_value']).setText('Sig Val · 低通后' if host and filtered else 'Sig Val')
+        self.table.horizontalHeaderItem(CHANNEL_TABLE_COLUMN_INDEX['signal_plot']).setText('Sig · 低通后' if host and filtered else 'Sig')
+
+    def _signal_display_changed(self, *_):
+        # 仅切换显示，历史两路一直按采样计算；不重置状态、参考或触摸轨迹。
+        self._update_signal_display_labels()
+        self._last_snapshot_version = -1
+        self._schedule_save()
+        self._log_host_settings()
+
     def _watch_tab_changed(self, *_):
         if self.plot_tabs.currentWidget() is self.watch_face:
             self.touchpad.stop_mouse()
@@ -641,9 +796,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.control_tabs.setCurrentWidget(self.array_bar_settings)
 
     def _watch_mouse_changed(self, enabled):
+        if enabled and (self.control_tabs.currentWidget() is self.raw_gain_calibration
+                        or self.raw_gain_calibration.engine.capturing):
+            self.touchpad.stop_mouse()
+            return
         if enabled and self.plot_tabs.currentWidget() is self.watch_face:
             self.touchpad.stop_mouse()
             self.status_label.setText('表盘直接接收触摸手势，无需开启系统鼠标控制')
+
+    def _calibration_tab_changed(self, *_):
+        if self.control_tabs.currentWidget() is self.raw_gain_calibration:
+            self.touchpad.stop_mouse()
 
     def _centroid_smoothing_changed(self, enabled):
         self.centroid_view.smoothing_enabled = enabled
@@ -825,6 +988,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not connected and hasattr(self, 'slide_test'):
             self.slide_test.stop('串口断开')
         if bool(connected) != self._connected:
+            self.raw_gain_calibration.invalidate('传感器连接已改变')
             self.touchpad.invalidate('连接已改变，请松手重新采集触摸板参考')
             self._reset_host_state()
         self._connected = bool(connected)
@@ -842,6 +1006,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def recalibrate(self):
         if self.reader is not None and self.reader.send_recalibration():
+            self.raw_gain_calibration.invalidate('固件重新校准已请求')
             self.touchpad.invalidate('固件基线重新校准，请松手重新采集触摸板参考')
             self._reset_host_state()
             self.status_label.setText('已请求全部通道重新校准基线，请保持释放')
@@ -869,6 +1034,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.nsub_status_label.setText('TxDivider必须为偶数')
             return
         if self.reader.set_matrix_config(nsub,tx,ref):
+            self.raw_gain_calibration.invalidate('三参数已改变')
             self.touchpad.invalidate('三参数已改变，请松手重新采集触摸板参考')
             self._reset_host_state('三参数改变；请保持释放，重新初始化')
             self._requested_params = (nsub,tx,ref)
@@ -978,6 +1144,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     plot = self.raw_plot if key in ('raw','baseline') else self.signal_plot if key == 'signal' else self.k_plot
                     name = {'raw': 'input', 'fast': '压力速度'}.get(key, key) if self.waveform_source.currentData() == 'host' else key
                     plot.plotItem.legend.addItem(self.curves[key][i], f'CH{i} {name}')
+        self._update_speed_extrema()
         self._last_snapshot_version = -1
         self._schedule_save()
 
@@ -998,6 +1165,34 @@ class MainWindow(QtWidgets.QMainWindow):
     def auto_range(self):
         for plot in self.plots.values():
             plot.enableAutoRange()
+
+    def _clear_speed_extrema(self):
+        self._speed_extrema_data = None
+        for line in self.speed_extrema_lines.values():
+            line.hide()
+
+    def _update_speed_extrema(self, *_):
+        # 使用绘制时同一批速度历史；平移、缩放后仅统计实际可见的采样点。
+        data = self._speed_extrema_data
+        if (self.waveform_source.currentData() != 'host' or data is None
+                or data[0] != self.host_observation_channel.currentData()
+                or not self.plot_checkboxes['fast'][data[0]].isChecked()):
+            for line in self.speed_extrema_lines.values():
+                line.hide()
+            return
+        channel, x, speeds = data
+        left, right = self.k_plot.getViewBox().viewRange()[0]
+        finite = [value for index, value in zip(x, speeds)
+                  if left <= index <= right and math.isfinite(value)]
+        if not finite:
+            for line in self.speed_extrema_lines.values():
+                line.hide()
+            return
+        for name, value in (('最大', max(finite)), ('最小', min(finite))):
+            line = self.speed_extrema_lines[name]
+            line.setValue(value)
+            line.label.setFormat(f'CH{channel} 窗口{name} {value:+.3f} %/s')
+            line.show()
 
     def _draw_state_background(self, history):
         runs = []
@@ -1023,8 +1218,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh_plots(self):
         host_touchpad = self.touchpad.tracker.source in self.touchpad.tracker.HOST_SOURCES
         touchpad_samples = []
-        sequence = min(self.host_state_machine.last_sequence, self.touchpad.last_sequence) if host_touchpad else self.host_state_machine.last_sequence
-        for pending in self.data_buffer.pointer_samples_after(sequence):
+        sequence = min(self.host_state_machine.last_sequence, self.touchpad.last_sequence,
+                       self.raw_gain_calibration.engine.last_sequence)
+        # Raw、派生模型的输入批次和波形表格共用同一采样边界；不在计算后重新取最新帧。
+        display_snapshot, pending_samples, sample = self.data_buffer.display_snapshot_after(sequence)
+        for pending in pending_samples:
             frame = self.host_state_machine.feed(pending)
             if frame is not None and self._connected:
                 self.rolling_log.submit('host_state_machine', port=self.current_port, frame=frame)
@@ -1038,11 +1236,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     host_ready=bool(frame and all(state != -1 for state in frame['state'])),
                     host_message=self.host_state_machine.reason))
         self.host_state_machine.expire(time.perf_counter())
+        self.raw_gain_calibration.process_samples(pending_samples, time.perf_counter())
         self.touchpad.process_samples(touchpad_samples if host_touchpad else
-                                     self.data_buffer.pointer_samples_after(self.touchpad.last_sequence))
+                                     [s for s in pending_samples if s['sequence'] > self.touchpad.last_sequence])
         self.host_state_settings.refresh()
-        raw,base,sig,fast,slow,states,histories,fps,frames,count,channels,_,_,version = self.data_buffer.snapshot()
-        sample = self.data_buffer.latest_sensor_sample()
+        raw,base,sig,fast,slow,states,histories,fps,frames,count,channels,_,_,version = display_snapshot
+        if sample is not None:
+            sample = dict(sample, age_seconds=max(0., time.perf_counter() - sample['sample_timestamp']))
         self._refresh_centroid(sample)
         self._refresh_array_bars(sample)
         temperature = '--'
@@ -1063,6 +1263,8 @@ class MainWindow(QtWidgets.QMainWindow):
         names, palette = STATE_NAMES, STATE_COLORS
         if host:
             values = self.host_state_machine.snapshot()
+            if self.host_state_settings.signal_filtered_box.isChecked():
+                values['signal'] = values['signal_filtered']
             raw, base, sig, fast, slow = (values[k] for k in ('raw', 'baseline', 'signal', 'fast', 'slow'))
             histories = values['state']
             states = [c.state for c in self.host_state_machine.channels]
@@ -1073,6 +1275,12 @@ class MainWindow(QtWidgets.QMainWindow):
             for i in range(self.channel_count):
                 if curves[i].isVisible():
                     curves[i].setData(x,values[key][i])
+        channel = self.host_observation_channel.currentData()
+        if host and channel < len(fast):
+            self._speed_extrema_data = (channel, x, fast[channel])
+            self._update_speed_extrema()
+        else:
+            self._clear_speed_extrema()
         for i in range(self.channel_count):
             state = int(states[i])
             label = self.value_labels['state'][i]
@@ -1184,14 +1392,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_label.setText('实验参数已保存；请保持释放完成初始化。')
         return saved, str(self._config_path.resolve()) if saved else self.status_label.text()
 
-    def save_display_config(self, *, host_parameters=None):
+    def save_display_config(self, *, host_parameters=None, array_parameters=None):
         self._save_timer.stop()
         config = {'history':self.history_input.value(),'background':self.state_background_channel_combo.currentData(),
+                  'ui_font_px':self._ui_font_px,
                   'touchpad':self.touchpad.settings(),
                   'slide_test':self.slide_test.settings(),
                   'watch_face':self.watch_settings.settings(),
-                  'array_bars':self.array_bar_settings.settings(),
+                  'array_bars':self.array_bar_settings.settings() if array_parameters is None else array_parameters,
+                  'raw_gain_calibration':self.raw_gain_calibration.settings(),
+                  'raw_gain_calibration_record':self.raw_gain_calibration.resume_path(),
                   'host_state_machine':self.host_state_settings.settings() if host_parameters is None else host_parameters,
+                  'host_signal_filtered_display':self.host_state_settings.signal_filtered_box.isChecked(),
                   'waveform_source':self.waveform_source.currentData(),
                   'host_observation_channel':self.host_observation_channel.currentData(),
                   'centroid_smoothing':self.centroid_smoothing_checkbox.isChecked(),
@@ -1213,14 +1425,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
 
     def _load_display_config(self):
+        config = {}
         try:
             config = json.loads(self._config_path.read_text(encoding='utf-8'))
+            self._apply_font_size(config.get('ui_font_px', DEFAULT_FONT_PX))
             self.touchpad.load_settings(config.get('touchpad', {}))
             self.slide_test.load_settings(config.get('slide_test', {}))
             self.watch_settings.load_settings(config.get('watch_face', {}))
             self.array_bar_settings.load_settings(config.get('array_bars', {}))
+            self.raw_gain_calibration.load_settings(config.get('raw_gain_calibration', {}))
             self._sync_touchpad_raw_gains()
             self.host_state_settings.load_settings(config.get('host_state_machine', {}))
+            self.host_state_settings.signal_filtered_box.setChecked(config.get('host_signal_filtered_display') is True)
             self.waveform_source.setCurrentIndex(1 if config.get('waveform_source') == 'host' else 0)
             self._centroid_signal_threshold = max(0,min(65535,int(config.get('centroid_signal_threshold',100))))
             self.centroid_threshold_input.setValue(self._centroid_signal_threshold)
@@ -1251,6 +1467,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._select_host_observation(max(0,min(19,int(config.get('host_observation_channel', config.get('background',0))))))
         except (OSError,ValueError,TypeError,AttributeError):
             pass
+        self.raw_gain_calibration.restore_last_record(config.get('raw_gain_calibration_record') if isinstance(config,dict) else None)
 
     def closeEvent(self, event):
         self.slide_test.stop('关闭窗口')

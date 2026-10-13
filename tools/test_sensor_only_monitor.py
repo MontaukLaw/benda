@@ -40,7 +40,7 @@ sys.excepthook=report_exception
 window=MainWindow()
 window.show()
 app.processEvents()
-assert [window.control_tabs.tabText(i) for i in range(window.control_tabs.count())] == ['监控','波形设置','三参数','串口日志','固件升级','触摸板','表盘设置','柱状图设置','基线与状态机']
+assert [window.control_tabs.tabText(i) for i in range(window.control_tabs.count())] == ['监控','标定','波形设置','三参数','串口日志','固件升级','触摸板','表盘设置','柱状图设置','基线与状态机']
 graphs = window.main_splitter.widget(0)
 assert [window.plot_tabs.tabText(i) for i in range(window.plot_tabs.count())] == ['波形图','阵列质心','触摸板光标','滑动测试','圆形表盘','3D柱状图']
 assert window.plot_tabs.currentWidget() is window.watch_face
@@ -77,6 +77,26 @@ assert window.control_tabs.isAncestorOf(window.port_combo)
 assert window.control_tabs.isAncestorOf(window.history_input)
 assert window.control_tabs.isAncestorOf(window.nsub_input)
 assert window.reader is None and window.table.rowCount() == 20
+from font_scale import scaled_font_size
+assert window._ui_font_px == 13
+original_height = window.table.rowHeight(0)
+for _ in range(5): window.font_larger_button.click()
+app.processEvents()
+assert window._ui_font_px == window.live_status.font().pixelSize() == 18
+assert window.table.rowHeight(0) > original_height
+assert scaled_font_size(window.array_bars,12) == 17
+assert window.raw_plot.getAxis('left').style['tickFont'].pixelSize() == 18
+assert window.raw_plot.getAxis('left').labelText == 'count'
+assert window.raw_plot.getAxis('bottom').labelText == '采样帧'
+window.save_display_config()
+assert json.loads(window._config_path.read_text(encoding='utf-8'))['ui_font_px'] == 18
+window.font_smaller_button.click()
+window._load_display_config()
+assert window._ui_font_px == 18
+for _ in range(5): window.font_smaller_button.click()
+app.processEvents()
+assert window._ui_font_px == 13 and window.table.rowHeight(0) == original_height
+window.save_display_config()
 assert len(window.table_row_buttons) == 20
 assert 'force_sum_select' not in CHANNEL_TABLE_COLUMN_INDEX
 assert len(window.curves['signal']) == 20
@@ -273,7 +293,8 @@ assert window.centroid_view.centroid == held_xy
 # 相同串口采样不再更新时，GUI时钟仍须让冻结点到时消失，并只记一次超时事件。
 old_sample=dict(window.data_buffer.latest_sensor_sample(),age_seconds=.15)
 window._connected=True
-with patch.object(window.data_buffer,'latest_sensor_sample',return_value=old_sample), patch.object(window.rolling_log,'submit') as log:
+with patch.object(window.data_buffer,'latest_sensor_sample',return_value=old_sample), patch.object(window.rolling_log,'submit') as log, \
+        patch('sensor_window.time.perf_counter',return_value=old_sample['sample_timestamp']+.15):
     window.refresh_plots()
     assert window.centroid_view.centroid is None
     assert not window.centroid_view.position_filter.holding_position
@@ -287,7 +308,8 @@ window.centroid_smoothing_checkbox.setChecked(True)
 window.data_buffer.append_frame(frame)
 window.refresh_plots()
 stale=dict(window.data_buffer.latest_sensor_sample(),age_seconds=1)
-with patch.object(window.data_buffer,'latest_sensor_sample',return_value=stale):
+with patch.object(window.data_buffer,'latest_sensor_sample',return_value=stale), \
+        patch('sensor_window.time.perf_counter',return_value=stale['sample_timestamp']+1):
     window.refresh_plots()
 assert window.centroid_view.centroid is None
 for values in ([0]*20, [100]*19, [float('nan')]+[100]*19):
@@ -337,7 +359,7 @@ if os.environ.get('MATRIX20_SCREENSHOT'):
     window.resize(1920,1080)
     app.processEvents()
     window.grab().save(os.environ['MATRIX20_SCREENSHOT'])
-    window.control_tabs.setCurrentIndex(1)
+    window.control_tabs.setCurrentIndex(next(i for i in range(window.control_tabs.count()) if window.control_tabs.tabText(i)=='波形设置'))
     app.processEvents()
     window.grab().save(os.environ['MATRIX20_SCREENSHOT'].replace('.png','_settings.png'))
 window.save_display_config()

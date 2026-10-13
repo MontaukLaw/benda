@@ -3,6 +3,7 @@ import time
 from collections import deque
 
 from qt_compat import QtCore, QtGui, QtWidgets, Signal
+from font_scale import scaled_font_size
 from touchpad import TouchpadTracker, FractionalMotion
 from centroid_filter import centroid_mm, SENSOR_PITCH_MM, SENSOR_DIAMETER_MM
 
@@ -31,7 +32,7 @@ class PointerCanvas(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), QtGui.QColor('#080d13'))
         p.setPen(QtGui.QColor('#d9e7f0'))
-        p.drawText(QtCore.QRectF(16, 12, self.width()-32, 30),
+        p.drawText(QtCore.QRectF(16, 12, self.width()-32, max(30,p.fontMetrics().height()+4)),
                    QtCore.Qt.AlignmentFlag.AlignCenter, '相对触摸板 · 1920 × 1080 试验画布')
         scale = min((self.width()-48)/1920, (self.height()-130)/1080)
         left, top = (self.width()-1920*scale)/2, 52+(self.height()-130-1080*scale)/2
@@ -51,7 +52,8 @@ class PointerCanvas(QtWidgets.QWidget):
         p.setPen(QtGui.QPen(QtGui.QColor('#def8ff'), 2))
         p.setBrush(QtGui.QColor('#38c8ed'))
         p.drawEllipse(point, 7, 7)
-        p.drawText(QtCore.QRectF(12, self.height()-65, self.width()-24, 55),
+        height = max(55,p.fontMetrics().height()*2+4)
+        p.drawText(QtCore.QRectF(12, self.height()-height-10, self.width()-24, height),
                    QtCore.Qt.AlignmentFlag.AlignCenter | QtCore.Qt.TextFlag.TextWordWrap,
                    f'{self.message}\nX {self.cursor[0]:.1f}  Y {self.cursor[1]:.1f}')
 
@@ -417,7 +419,7 @@ class TouchpadPanel(QtWidgets.QWidget):
                           unstable='强制采集 · 等待Raw稳定', complete='强制采集完成')
         color = '#70e3a0' if stage == 'complete' else '#ffd479' if self.tracker.calibrating else '#9bb7ca'
         self.reference_status_label.setText(titles[stage])
-        self.reference_status_label.setStyleSheet(f'color:{color};font-weight:bold;font-size:15px;')
+        self.reference_status_label.setStyleSheet(f'color:{color};font-weight:bold;font-size:{scaled_font_size(self,15)}px;')
         self.reference_progress.setValue(capture['progress'])
         self.reference_progress.setFormat('采集完成 100%' if stage == 'complete' else '%p%')
         detail = capture['detail']

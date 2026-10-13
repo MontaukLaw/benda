@@ -44,7 +44,8 @@ def _make_run_force_vector(frame, region, now):
 
 class AlgoDataBuffer:
     def __init__(self, sample_count=DEFAULT_HISTORY_LENGTH):
-        self._lock = threading.Lock()
+        # 组合快照会复用已有读取方法，重入锁保证这些读取属于同一个采样边界。
+        self._lock = threading.RLock()
         self._raw_response = RawResponse()
         self._raw_config_signature = None
         self._sample_count = sample_count
@@ -210,6 +211,11 @@ class AlgoDataBuffer:
             finger_pad_force_vector = dict(self._finger_pad_force_vector) if self._finger_pad_force_vector is not None else None
             version = self._version
         return raw, baseline, signal, fast_k_percent, slow_k_percent, states, state_history, fps, total_frames, sample_count, channel_count, force_vector, finger_pad_force_vector, version
+
+    def display_snapshot_after(self, sequence):
+        """一次锁内返回波形、待消费采样和最新采样，防止接收线程在读取间插入新帧。"""
+        with self._lock:
+            return self.snapshot(), self.pointer_samples_after(sequence), self.latest_sensor_sample()
 
     def latest_sensor_sample(self):
         """返回自动测试需要的最新通道数据，避免复制整段绘图历史。"""

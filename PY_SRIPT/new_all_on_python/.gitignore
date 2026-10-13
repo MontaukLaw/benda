@@ -1,0 +1,6 @@
+__pycache__/
+.pytest_cache/
+recordings/
+touch_config.json
+touch_config.json.tmp
+_verification/

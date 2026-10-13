@@ -3,6 +3,18 @@ from qt_compat import QtWidgets, Signal
 from host_state_machine import PARAMETERS, HostParameters, HOST_STATE_NAMES
 
 
+# 按用途分组显示；计算保护项仅保存在 JSON，不创建可编辑控件。
+JSON_ONLY_PARAMETERS = frozenset(('normalization_floor', 'gap_seconds'))
+PARAMETER_GROUPS = (
+    ('输入与初始化参数', ('input_alpha', 'signal_alpha', 'initial_seconds', 'window')),
+    ('idle激活的条件参数', ('idle_alpha', 'activate_threshold', 'activate_frames')),
+    ('激活后释放条件参数', ('drop_rate', 'drop_frames', 'release_threshold', 'release_frames')),
+    ('slowback到recover条件参数', ('slowback_frames', 'slowback_tolerance_percent', 'slowback_close_frames')),
+    ('recover到idle的条件参数', ('recover_alpha', 'recover_tolerance', 'stable_rate', 'recover_frames')),
+    ('恢复阶段再次激活条件参数', ('reload_rate', 'reload_threshold', 'reload_reference_margin', 'reload_frames')),
+)
+
+
 def format_activation_reason(evidence):
     if not evidence:
         return '--', '本轮初始化后尚未激活。下一次激活时记录原因，退出 activate 后保留。'
@@ -29,6 +41,7 @@ class HostStatePanel(QtWidgets.QScrollArea):
     waveform_requested = Signal()
     reset_requested = Signal()
     observation_changed = Signal(int)
+    signal_display_changed = Signal(bool)
 
     def __init__(self, engine, save_callback=None):
         super().__init__()
@@ -38,16 +51,6 @@ class HostStatePanel(QtWidgets.QScrollArea):
         content = QtWidgets.QWidget()
         self.setWidget(content)
         layout = QtWidgets.QVBoxLayout(content)
-        note = QtWidgets.QLabel('上位机实验 · 20 通道独立状态，共用以下可调参数。\n'
-            '输入 = Raw × 柱状图逐通道增益，再低通；激活差值 = input − baseline。\n'
-            '速度 = 最近窗口按采样时间回归的斜率 ÷ 当前 input × 100，单位 %/s。\n'
-            'idle / recover 跟踪基线；activate / slowback 冻结基线。仅 activate 输出 Signal。\n'
-            '速度仅在 activate 显示；等待和恢复时用于重新加载及恢复稳定判定。\n'
-            '重新加载另需超过卸载前保存的基线及余量，避免下冲后的回弹误激活。\n'
-            '通道状态、数值和最近激活原因请在“监控”页查看。\n'
-            '实验输出可由柱状图、触摸板选择使用；固件上报数据独立保留。应用参数及重置时请保持释放。')
-        note.setWordWrap(True)
-        layout.addWidget(note)
         observation_row = QtWidgets.QHBoxLayout()
         observation_row.addWidget(QtWidgets.QLabel('实验观察通道'))
         self.observation_channel = QtWidgets.QComboBox()
@@ -73,24 +76,40 @@ class HostStatePanel(QtWidgets.QScrollArea):
         self.status = QtWidgets.QLabel()
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        group = QtWidgets.QGroupBox('状态切换与基线参数')
-        form = QtWidgets.QFormLayout(group)
+        self.signal_filtered_box = QtWidgets.QCheckBox('显示低通后的上位机 Signal（关闭：显示低通前）')
+        self.signal_filtered_box.setToolTip('即时切换上位机 Signal 的波形、监控表数值和柱状图，自动保存选择。\n'
+            '不改变状态判定或触摸位置计算；低通后松开时显示值会缓降到零。\n'
+            'alpha 越小越平滑、延迟越大；1 表示不平滑。修改 alpha 后点击“确认生效并保存”。')
+        self.signal_filtered_box.toggled.connect(self.signal_display_changed.emit)
+        layout.addWidget(self.signal_filtered_box)
         self.inputs = {}
-        for key, label, default, low, high, decimals in PARAMETERS:
-            widget = QtWidgets.QDoubleSpinBox() if decimals else QtWidgets.QSpinBox()
-            if decimals:
-                widget.setDecimals(decimals)
-            widget.setRange(low, high)
-            widget.setValue(default)
-            widget.setKeyboardTracking(False)
-            widget.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-            widget.setMinimumWidth(130)
-            if key == 'reload_reference_margin':
-                widget.setToolTip('上位机增益后的count。input还须超过卸载前保存的基线加此余量才能重新加载；0关闭额外保护。调高更能抑制回弹，也会延迟较轻的重新按压。')
-            widget.valueChanged.connect(self._edited)
-            self.inputs[key] = widget
-            form.addRow(label, widget)
-        layout.addWidget(group)
+        definitions = {key: (label, default, low, high, decimals)
+                       for key, label, default, low, high, decimals in PARAMETERS}
+        for title, keys in PARAMETER_GROUPS:
+            layout.addSpacing(12)
+            group = QtWidgets.QGroupBox(title)
+            form = QtWidgets.QFormLayout(group)
+            form.setVerticalSpacing(8)
+            for key in keys:
+                label, default, low, high, decimals = definitions[key]
+                widget = QtWidgets.QDoubleSpinBox() if decimals else QtWidgets.QSpinBox()
+                if decimals:
+                    widget.setDecimals(decimals)
+                widget.setRange(low, high)
+                widget.setValue(default)
+                widget.setKeyboardTracking(False)
+                widget.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+                widget.setMinimumWidth(130)
+                if key == 'reload_reference_margin':
+                    widget.setToolTip('上位机增益后的count。input还须超过卸载前保存的基线加此余量才能重新加载；0关闭额外保护。调高更能抑制回弹，也会延迟较轻的重新按压。')
+                elif key == 'signal_alpha':
+                    widget.setToolTip('每帧：低通后 Signal = 上帧低通值 × (1-alpha) + 本帧原 Signal × alpha。\n'
+                        '范围大于0且不超过1；越小越平滑、延迟越大，1表示不平滑。只影响显示。\n'
+                        '与其他实验参数一起确认生效并保存，应用时请保持释放完成重新初始化。')
+                widget.valueChanged.connect(self._edited)
+                self.inputs[key] = widget
+                form.addRow(label, widget)
+            layout.addWidget(group)
         self.bottom_apply_button = QtWidgets.QPushButton('确认生效并保存')
         self.bottom_apply_button.setToolTip(self.apply_button.toolTip())
         layout.addWidget(self.bottom_apply_button)
@@ -98,11 +117,13 @@ class HostStatePanel(QtWidgets.QScrollArea):
         self.bottom_message.setWordWrap(True)
         layout.addWidget(self.bottom_message)
         legend = QtWidgets.QLabel('状态背景：idle 绿 / activate 棕 / slowback 蓝 / recover 紫。\n'
+            'Signal 显示低通按每个采样更新，默认 alpha=0.1；开关不重置算法。\n'
             'slowback 达到最长等待或相对基线差值连续达标时进入 recover；快速上升时暂停提前恢复。\n'
             '回弹尚未越过卸载前参考基线时，recover继续跟踪；真正上升候选才冻结基线。\n'
             '初始化取低通 input 的最大值；增益为 0 的通道停用。恢复需差值和速度同时达标。')
         legend.setWordWrap(True)
         layout.addWidget(legend)
+        legend.hide()
         layout.addStretch(1)
         self.apply_button.clicked.connect(self.apply)
         self.bottom_apply_button.clicked.connect(self.apply)
@@ -126,7 +147,10 @@ class HostStatePanel(QtWidgets.QScrollArea):
         for widget in self.inputs.values():
             widget.interpretText()
         try:
-            parameters = HostParameters(**{key: widget.value() for key, widget in self.inputs.items()})
+            # 合并可见编辑项与已加载参数，防止应用时把 JSON 专属值还原为默认值。
+            settings = self.engine.parameters.settings()
+            settings.update({key: widget.value() for key, widget in self.inputs.items()})
+            parameters = HostParameters(**settings)
         except ValueError as exc:
             self._set_message(f'未应用、未保存：{exc}', '#ff8d78')
             return False
@@ -149,10 +173,10 @@ class HostStatePanel(QtWidgets.QScrollArea):
         except (TypeError, ValueError, AttributeError):
             parameters = HostParameters()
         self.engine.configure(parameters)
-        for key, value in parameters.settings().items():
-            self.inputs[key].blockSignals(True)
-            self.inputs[key].setValue(value)
-            self.inputs[key].blockSignals(False)
+        for key, widget in self.inputs.items():
+            widget.blockSignals(True)
+            widget.setValue(getattr(parameters, key))
+            widget.blockSignals(False)
         self._set_message('已加载参数；修改后请点击“确认生效并保存”。')
 
     def refresh(self):

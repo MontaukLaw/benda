@@ -4,6 +4,10 @@
 
 > 术语约定：本文及本项目后续提到“三参数”时，固定指CapSense的`Nsub`、`TxDivider`和`RefCDAC`。
 
+2026-10-05通信及构建入口核对：当前`INDEX_FINGER`已是4TX×5RX的20点MatrixButtons0，Makefile默认`RAW_ONLY=0`，使用[V21 DATA协议](UART_PROTOCOL_UNIFIED_V3_CN.md)。Baseline宏默认0，采样发送Type `0x16`（总长50字节）；宏设为1恢复通道算法后Run仅发Signal、其余模式发Debug，不恢复旧四通道合力及FLOATING锁定。启动使用Configurator生成值，本次为`Nsub=200、TxDivider=100、RefCDAC=30`，旧固定参数覆盖未启用。下文旧食指8通道映射、时基及固定参数表是历史配置，不适用于当前矩阵；THUMB/PINKY仍为5个独立Button。
+
+只有显式`RAW_ONLY=1`才使用`raw_stream.c`的46字节采集协议，构建命令和配套脚本见[RAW20说明](RAW20_SERIAL_CN.md)。它仅支持20点食指UART，不能用于原GUI。当前I2C构建使用`app_iic.c`，20通道数据帧90字节、5通道45字节，见[I2C协议](SENSOR_BUS_PROTOCOL_CN.md)。
+
 ## 1. 编译选择
 
 同一套 C 源码通过 Make 变量 `FINGER_TYPE` 选择设备。它同时完成两件事：
@@ -13,7 +17,7 @@
 
 | `FINGER_TYPE` | 设备名 | `device` | 通道数 | CapSense 拓扑 |
 | --- | --- | ---: | ---: | --- |
-| `INDEX_FINGER` | `INDEX_FINGER` | 1 | 8 | 4个独立Button + 1个2×2 MatrixButtons |
+| `INDEX_FINGER` | `INDEX_FINGER` | 1 | 20 | 当前1个4TX×5RX MatrixButtons0；旧8通道见历史映射 |
 | `THUMB` | `THUMB` | 2 | 5 | 5个独立Button |
 | `PINKY` | `PINKY` | 3 | 5 | 5个独立Button |
 
@@ -33,13 +37,13 @@ make build FINGER_TYPE=PINKY TRANSPORT_OPT=UART CONFIG=Debug
 .\build_firmware.ps1 -Target UART -FingerType PINKY
 ```
 
-输出目录按手指隔离：`build/<FINGER_TYPE>/<TRANSPORT_OPT>/...`，文件名也包含手指类型，避免连续编译时互相覆盖。
+输出目录按手指隔离：`build/<FINGER_TYPE>/<TRANSPORT_OPT>/...`。默认V21文件名含手指类型；显式RAW20使用`mtb-example-psoc4-raw20`，同目录可能留有另一构建的旧产物，须核对文件名和构建选项。
 
 ## 2. 配置文件位置
 
 | 内容 | 位置 | 维护方式 |
 | --- | --- | --- |
-| 食指8通道源配置 | `templates/TARGET_CY8CPROTO-041TP/config/` | 用 Device/CapSense Configurator 修改；重新生成 BSP 后确认生成结果 |
+| 当前食指20点源配置及生成结果 | `bsps/TARGET_APP_CY8CPROTO-041TP/config/`及`GeneratedSource/` | 用Configurator修改并重新生成；`templates/`的旧8点配置不能代替当前BSP |
 | 拇指/小指5通道源配置 | `firmware_variants/thumb_pinky/config_sources/design.modus`、`design.cycapsense` | 来源为 `THUM_PINKY_NEW`，修改后需要重新生成下方源码 |
 | 拇指/小指5通道生成源码 | `firmware_variants/thumb_pinky/generated/` | Configurator 自动生成，不手工修改 |
 | C层变体入口 | `device_variant.h` | 增加设备类型或分离参数时从这里扩展 |
@@ -48,7 +52,9 @@ make build FINGER_TYPE=PINKY TRANSPORT_OPT=UART CONFIG=Debug
 
 ## 3. 传感器和引脚映射
 
-### 3.1 INDEX_FINGER（8通道）
+### 3.1 INDEX_FINGER历史8通道映射
+
+当前20点矩阵的`CH(4×r+t)`对应MatrixButtons0的`RXr/TXt`（r=0..4，t=0..3），真实引脚以当前BSP生成配置为准。以下只保留旧8点产品映射。
 
 | 逻辑通道 | Widget/Sensor | Rx | Tx | 说明 |
 | ---: | --- | --- | --- | --- |

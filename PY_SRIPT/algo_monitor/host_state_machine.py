@@ -14,6 +14,7 @@ HOST_STATE_COLORS = {-2: '#444444', -1: '#49324e', 0: '#204f3b',
 # 键、标签、默认值、最小值、最大值、小数位。全部单位放在标签中。
 PARAMETERS = (
     ('input_alpha', '输入低通 alpha', .2, .000001, 1., 6),
+    ('signal_alpha', 'Signal 低通 alpha（仅显示）', .1, .000001, 1., 6),
     ('initial_seconds', '释放初始化时长（秒，期间取最大值）', 3., .01, 60., 2),
     ('window', '速度回归窗口（采样帧）', 20, 2, 500, 0),
     ('activate_threshold', '激活差值 input − baseline（count）', 200., 0., 65535000., 2),
@@ -42,6 +43,7 @@ PARAMETERS = (
 @dataclass(frozen=True)
 class HostParameters:
     input_alpha: float = .2
+    signal_alpha: float = .1
     initial_seconds: float = 3.
     window: int = 20
     activate_threshold: float = 200.
@@ -91,6 +93,7 @@ class _Channel:
     def __init__(self, window):
         self.state = -1
         self.input = self.baseline = self.signal = 0.
+        self.signal_filtered = 0.
         self.rate = math.nan
         self.decision_rate = math.nan
         self.started = None
@@ -167,19 +170,21 @@ class _Channel:
         else:
             self.input += p.input_alpha * (raw - self.input)
         self.history.append((timestamp, self.input))
+        # 各状态都逐采样计算观察速度；窗口不足或分母过小时返回无效值。
+        self.rate = self.slope_rate(p)
         self.signal = 0.
         if self.state == -1:
             self.baseline = max(self.baseline, self.input)
             if timestamp - self.started >= p.initial_seconds:
                 self.commit_state(0)
             return
-        # idle 不计算速度；窗口仍保留，以便激活当帧立即具备有效历史。
-        rate = self.slope_rate(p) if self.state in (1, 2, 3) else math.nan
+        # 状态判定沿用原入口，idle 的实时观察速度不参与激活条件。
+        rate = self.rate if self.state in (1, 2, 3) else math.nan
         difference = self.input - self.baseline
         if self.state == 0:
             self.activate_count = self.activate_count + 1 if difference > p.activate_threshold else 0
             if self.activate_count >= p.activate_frames:
-                rate = self.slope_rate(p)
+                rate = self.rate
                 self.commit_state(1, self.activation_evidence(timestamp, rate, p))
             elif not self.activate_count:
                 self.baseline += p.idle_alpha * difference
@@ -222,9 +227,8 @@ class _Channel:
                     self.commit_state(0)
             else:
                 self.recover_count = 0
-        # 等待与恢复保留内部判定速度，公开速度仅在 activate 输出。
+        # 单独保存本帧参与判定的速度；公开速度持续输出，不受真实状态切换遮蔽。
         self.decision_rate = rate
-        self.rate = rate if self.state == 1 else math.nan
         if self.state == 1:
             self.signal = max(self.input - self.baseline, 0.)
 
@@ -246,7 +250,7 @@ class HostStateMachine:
         # 保留已消费的序号，防止重新初始化后回放旧的缓存帧。
         self.channels = [_Channel(self.parameters.window) for _ in range(self.CHANNELS)]
         self.histories = {key: [deque(maxlen=self.history_length) for _ in self.channels]
-                          for key in ('raw', 'baseline', 'signal', 'fast', 'slow', 'state')}
+                          for key in ('raw', 'baseline', 'signal', 'signal_filtered', 'fast', 'slow', 'state')}
         self.last_timestamp = None
         self.reason = reason
         self.reset_reason = reason
@@ -297,6 +301,11 @@ class HostStateMachine:
         for index, (channel, value, gain) in enumerate(zip(self.channels, values, self.gains)):
             activation_number = channel.activation_number
             channel.feed(value, timestamp, gain > 0, self.parameters)
+            # 显示低通逐采样更新，包含释放后的零值；不反馈到基线、速度或状态判定。
+            if gain > 0:
+                channel.signal_filtered += self.parameters.signal_alpha * (channel.signal - channel.signal_filtered)
+            else:
+                channel.signal_filtered = 0.
             if channel.activation_number != activation_number:
                 activation_events.append(dict(channel=index, **channel.last_activation))
         self.last_timestamp = timestamp
@@ -305,11 +314,15 @@ class HostStateMachine:
                      generation=self.generation, reset_reason=self.reset_reason,
                      activation_events=activation_events,
                      input_val=[c.input for c in self.channels], baseline=[c.baseline for c in self.channels],
-                     signal=[c.signal for c in self.channels], pressure_rate=[c.rate for c in self.channels],
+                     signal=[c.signal for c in self.channels],
+                     signal_filtered=[c.signal_filtered for c in self.channels],
+                     signal_alpha=self.parameters.signal_alpha,
+                     pressure_rate=[c.rate for c in self.channels],
                      decision_rate=[c.decision_rate for c in self.channels],
                      release_reference=[c.release_reference for c in self.channels],
                      state=[c.state for c in self.channels])
         for key, source in (('raw', 'input_val'), ('baseline', 'baseline'), ('signal', 'signal'),
+                            ('signal_filtered', 'signal_filtered'),
                             ('fast', 'pressure_rate'), ('state', 'state')):
             for history, value in zip(self.histories[key], frame[source]):
                 history.append(value)

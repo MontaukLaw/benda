@@ -2,7 +2,7 @@
 import json as _json
 
 SESSION_INFO = _json.loads(r'''{
-  "extension_dir": "c:/Users/MARC/.vscode/extensions/infineonag.modustoolbox-ai-0.5.0-win32-x64",
+  "extension_dir": "c:/Users/MARC/.vscode/extensions/infineonag.modustoolbox-ai-0.6.0-win32-x64",
   "workspace_path": "d:/work/INFENEON_MAIN_LINE/BENDA",
   "projects": [
     "BENDA"
@@ -12,9 +12,9 @@ SESSION_INFO = _json.loads(r'''{
   "board_target": "TARGET_APP_CY8CPROTO-041TP",
   "cy_tools_path": "C:/Infineon/Tools/ModusToolbox/tools_3.7",
   "modus_shell_path": "C:/Infineon/Tools/ModusToolbox/tools_3.7/modus-shell",
-  "tcp_port": 57868,
-  "ext_port": 57867,
-  "pid": 41376,
+  "tcp_port": 57599,
+  "ext_port": 57595,
+  "pid": 68752,
   "log_level": "info",
   "log_file": "C:/Users/MARC/AppData/Local/Temp/mtbai-logs/mtbai.log"
 }''')

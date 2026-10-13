@@ -2,6 +2,8 @@
 
 > V21 继续使用本文的 V20 数据帧布局，增加主法向 1～30 N 的 10/20 点 K 表读写资格；新功能见 [自动压力标定](HIGH_FORCE_CALIBRATION_CN.md)。当前固件版本为 V21，配套上位机兼容解析 V20/V21。
 
+2026-10-05核对：本文主要定义启用通道算法后的Type `0x10`。当前默认`RAW_ONLY=0`、`SENSOR_ALGO_BASELINE_ENABLED=0`，实际采样发送V21 Type `0x16`，只包含`N`个小端uint16 Raw，payload为`2*N`字节；当前20通道食指总长50字节，5通道总长20字节。Baseline/Signal占位0、状态-1及K为NaN均由上位机补齐，不是上传测量值，详见[主协议](UART_PROTOCOL_UNIFIED_V3_CN.md)第3.10节。独立`RAW_ONLY=1`的46字节RAW20另见[专项文档](RAW20_SERIAL_CN.md)。
+
 2026-09-19：当前固定三参数固件使用硬件 Raw 直接驱动算法。删除 Norm Raw、Candidate Norm Raw 的运行时副本及 UART Debug 字段，删除独立 Slow Baseline 的计算、缓存和上传。正常 Baseline 跟踪和通道状态机保持原有行为。
 
 ## UART 布局
@@ -19,7 +21,9 @@
 | slow_k_percent_x100 | int32 | 慢速斜率，解码后单位 %/s |
 | state | uint16 | 状态机提交的真实通道状态 |
 
-载荷长度为 `16*N`：食指 8 通道为 128 字节，拇指/小指 5 通道为 80 字节；含帧头分别为 138、90 字节。不能再使用旧版 `26*N` 的长度解析 V20/V21。
+Type `0x10`载荷长度为`16*N`：当前食指20通道320字节，历史食指8通道128字节，拇指/小指5通道80字节；含帧头分别为330、138、90字节。不能再使用旧版`26*N`的长度解析V20/V21，也不能把此Debug长度用于Type `0x16`纯Raw帧。
+
+20点矩阵恢复通道算法后，Run仅发Type `0x01`，Debug及Force Calibration均发Type `0x10`；不上传旧四通道合力和Type `0x02/0x20`力采样。旧压力标定流程不能仅靠恢复Baseline宏直接套用。
 
 删除固定 Noise 数组。内部算法仍使用固定噪声参数 1，不把它当作实测噪声。Type `0x15` Slow Baseline 在 V20 停用，编号保留、不复用。
 

@@ -1,6 +1,8 @@
 # 多通道压力传感器与电机标定工具
 
-本工程包含PSoC固件、传感器协议及Python监控上位机。**当前功能和文档入口见[CURRENT_SYSTEM_CN.md](CURRENT_SYSTEM_CN.md)**，核对日期为2026-09-22；源码版本不代表板上已烧录的版本。
+本工程包含PSoC固件、传感器协议及Python监控上位机。**当前功能和文档入口见[CURRENT_SYSTEM_CN.md](CURRENT_SYSTEM_CN.md)**，综合功能核对日期为2026-09-22，通信协议补充核对日期为2026-10-05；源码版本不代表板上已烧录的版本。
+
+当前默认食指为20点矩阵纯Raw观察：`RAW_ONLY=0`、Baseline宏为0，使用V21 Type `0x16`，原GUI可接收。下文旧食指压力标定及高低力换算不适用于当前20点矩阵；重新启用Baseline宏也不会恢复旧四通道合力。显式`RAW_ONLY=1`是配套独立脚本的另一个46字节协议，见[RAW20说明](RAW20_SERIAL_CN.md)。
 
 ## 当前使用流程
 
@@ -41,9 +43,9 @@ python PY_SRIPT/algo_monitor/main.py
 
 ## 协议与配置
 
-当前算法UART为**V21**，沿用V20单一硬件Raw布局，上位机兼容V14～V21。完整帧与命令以[UART协议](UART_PROTOCOL_UNIFIED_V3_CN.md)为准；文件名中的V3是历史命名。I²C/SensorBus使用[独立协议](SENSOR_BUS_PROTOCOL_CN.md)，其版本号不跟随UART递增。`ALGO_PROTOCOL_README*.md`和`UART_PROTOCOL_CUSTOMER_CN.md`只供历史参考。
+当前算法UART为**V21**，默认采样为Type `0x16`纯Raw；启用通道算法后的Debug沿用V20布局，上位机兼容V14～V21。完整帧、命令与模式适用范围以[UART协议](UART_PROTOCOL_UNIFIED_V3_CN.md)为准，文件名中的V3是历史命名。独立RAW20须显式`RAW_ONLY=1`，不能与V21接收端混用。I²C使用[独立协议](SENSOR_BUS_PROTOCOL_CN.md)，其版本号不跟随UART递增。`ALGO_PROTOCOL_README*.md`和`UART_PROTOCOL_CUSTOMER_CN.md`只供历史参考。
 
-INDEX_FINGER启动三参数为`Nsub=300、TxDivider=100、RefCDAC=30`。这里“三参数”固定指这三项；手动修改仅在RAM。THUMB/PINKY硬件配置与食指不同，见[固件变体](FIRMWARE_VARIANTS_CN.md)。通道状态只能由`channel_state_machine.c`中的`commit_state()`提交，其他模块消费真实状态。
+INDEX_FINGER启动直接使用Configurator的20点矩阵配置，本次核对为`Nsub=200、TxDivider=100、RefCDAC=30`，实际值以`0x97/0x2C`回读为准。这里“三参数”固定指这三项，手动修改仅在RAM。THUMB/PINKY硬件配置与食指不同，见[固件变体](FIRMWARE_VARIANTS_CN.md)。通道状态只能由`channel_state_machine.c`中的`commit_state()`提交，其他模块消费真实状态。
 
 ## Flash与构建
 

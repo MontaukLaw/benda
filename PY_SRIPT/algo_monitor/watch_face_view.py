@@ -3,6 +3,7 @@ import math
 import time
 
 from qt_compat import QtCore, QtGui, QtWidgets, Signal
+from font_scale import scaled_font_size, font_scale_ratio
 from watch_face import WatchFaceModel, DEFAULTS, LIMITS, RADIUS, normalize_settings
 
 
@@ -12,7 +13,7 @@ COLORS = ('#ed4264','#f75283','#25a7ef','#678599','#f17939','#5c6fe7','#40c674',
           '#43a8ba','#8793ad','#4084ef','#a363ed','#ef6545','#d771c0','#27bdb0','#b39852')
 
 
-def draw_app(p, app_id, x, y, diameter, numbers):
+def draw_app(p, app_id, x, y, diameter, numbers, text_scale=1):
     p.save()
     p.translate(x,y)
     p.scale(diameter/64,diameter/64)
@@ -51,8 +52,11 @@ def draw_app(p, app_id, x, y, diameter, numbers):
         p.drawRoundedRect(QtCore.QRectF(-16,-17,32,33),4,4)
         p.drawLine(QtCore.QPointF(-16,-7),QtCore.QPointF(16,-7))
         for x0 in (-8,8):p.drawLine(QtCore.QPointF(x0,-20),QtCore.QPointF(x0,-13))
-        font=QtGui.QFont('Segoe UI');font.setPixelSize(18);font.setBold(True);p.setFont(font)
-        p.drawText(QtCore.QRectF(-16,-8,32,25),QtCore.Qt.AlignmentFlag.AlignCenter,str(app_id%28+1))
+        font=QtGui.QFont('Segoe UI');font.setPixelSize(max(1,round(18*text_scale)));font.setBold(True);p.setFont(font)
+        text=str(app_id%28+1)
+        height=max(25,p.fontMetrics().height()+2)
+        width=max(32,p.fontMetrics().horizontalAdvance(text)+2)
+        p.drawText(QtCore.QRectF(-width/2,4.5-height/2,width,height),QtCore.Qt.AlignmentFlag.AlignCenter,text)
     elif motif == 5:
         p.drawEllipse(QtCore.QPointF(0,-1),18,18)
         p.drawLine(QtCore.QPointF(0,-1),QtCore.QPointF(0,-13))
@@ -88,9 +92,10 @@ def draw_app(p, app_id, x, y, diameter, numbers):
         triangle=QtGui.QPolygonF([QtCore.QPointF(-10,-17),QtCore.QPointF(18,0),QtCore.QPointF(-10,17)])
         p.setBrush(QtGui.QColor('white'));p.drawPolygon(triangle)
     if numbers:
-        font=QtGui.QFont('Segoe UI');font.setPixelSize(8);font.setBold(True);p.setFont(font)
+        font=QtGui.QFont('Segoe UI');font.setPixelSize(max(1,round(8*text_scale)));font.setBold(True);p.setFont(font)
         p.setPen(QtGui.QColor(255,255,255,200))
-        p.drawText(QtCore.QRectF(-18,20,36,10),QtCore.Qt.AlignmentFlag.AlignCenter,f'{app_id+1:03}')
+        height=max(10,p.fontMetrics().height())
+        p.drawText(QtCore.QRectF(-24,30-height,48,height),QtCore.Qt.AlignmentFlag.AlignCenter,f'{app_id+1:03}')
     p.restore()
 
 
@@ -218,11 +223,12 @@ class WatchFaceCanvas(QtWidgets.QWidget):
         p=QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(),QtGui.QColor('#080d13'))
-        font=QtGui.QFont(self.font());font.setPixelSize(24);font.setBold(True);p.setFont(font)
+        font=QtGui.QFont(self.font());font.setPixelSize(scaled_font_size(self,24));font.setBold(True);p.setFont(font)
         p.setPen(QtGui.QColor('#e8eef6'))
-        p.drawText(QtCore.QRectF(20,18,self.width()-40,38),QtCore.Qt.AlignmentFlag.AlignCenter,'表盘应用')
-        font.setPixelSize(12);font.setBold(False);p.setFont(font);p.setPen(QtGui.QColor('#8197ad'))
-        p.drawText(QtCore.QRectF(20,56,self.width()-40,24),QtCore.Qt.AlignmentFlag.AlignCenter,'100 个应用  ·  循环蜂窝布局  ·  拖动探索')
+        title_height=max(38,p.fontMetrics().height()+4)
+        p.drawText(QtCore.QRectF(20,18,self.width()-40,title_height),QtCore.Qt.AlignmentFlag.AlignCenter,'表盘应用')
+        font.setPixelSize(scaled_font_size(self,12));font.setBold(False);p.setFont(font);p.setPen(QtGui.QColor('#8197ad'))
+        p.drawText(QtCore.QRectF(20,18+title_height,self.width()-40,max(24,p.fontMetrics().height()+4)),QtCore.Qt.AlignmentFlag.AlignCenter,'100 个应用  ·  循环蜂窝布局  ·  拖动探索')
         center,scale=self.geometry_info()
         p.save();p.translate(center);p.scale(scale,scale)
         rim=QtGui.QLinearGradient(-240,-300,240,300)
@@ -246,7 +252,7 @@ class WatchFaceCanvas(QtWidgets.QWidget):
             focus=self._focus.get(icon['id'],1.0 if icon['selected'] else 0.0)
             p.save()
             p.setOpacity(inactive_opacity+(1-inactive_opacity)*focus)
-            draw_app(p,icon['id'],icon['x'],icon['y'],diameter,self.model.settings['show_numbers'])
+            draw_app(p,icon['id'],icon['x'],icon['y'],diameter,self.model.settings['show_numbers'],font_scale_ratio(self))
             p.restore()
             # 多层柔光与细亮边跟随选中图标，焦点切换时交叉淡入淡出。
             intensity=focus*glow_strength
@@ -259,11 +265,12 @@ class WatchFaceCanvas(QtWidgets.QWidget):
                     p.drawEllipse(position,radius,radius)
         p.restore()
         name=APP_NAMES[focused['id']%16]
-        font.setPixelSize(17);font.setBold(True);p.setFont(font);p.setPen(QtGui.QColor('#e0eaf5'))
-        p.drawText(QtCore.QRectF(20,self.height()-78,self.width()-40,28),QtCore.Qt.AlignmentFlag.AlignCenter,f"{name}  /  {focused['id']+1:03}")
+        font.setPixelSize(scaled_font_size(self,17));font.setBold(True);p.setFont(font);p.setPen(QtGui.QColor('#e0eaf5'))
+        name_height=max(28,p.fontMetrics().height()+4)
+        p.drawText(QtCore.QRectF(20,self.height()-50-name_height,self.width()-40,name_height),QtCore.Qt.AlignmentFlag.AlignCenter,f"{name}  /  {focused['id']+1:03}")
         mode=dict(idle='已居中' if nearest['distance']<1 else '等待拖动',drag='正在拖动',inertia='惯性滑行',snap='自动居中')[self.model.phase]
-        font.setPixelSize(12);font.setBold(False);p.setFont(font);p.setPen(QtGui.QColor('#8197ad'))
-        p.drawText(QtCore.QRectF(20,self.height()-46,self.width()-40,24),QtCore.Qt.AlignmentFlag.AlignCenter,mode+'  ·  再次触摸可立即接管')
+        font.setPixelSize(scaled_font_size(self,12));font.setBold(False);p.setFont(font);p.setPen(QtGui.QColor('#8197ad'))
+        p.drawText(QtCore.QRectF(20,self.height()-46,self.width()-40,max(24,p.fontMetrics().height()+4)),QtCore.Qt.AlignmentFlag.AlignCenter,mode+'  ·  再次触摸可立即接管')
 
 
 class WatchFacePanel(QtWidgets.QScrollArea):

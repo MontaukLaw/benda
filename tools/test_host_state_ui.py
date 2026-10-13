@@ -12,14 +12,22 @@ SCRIPT = r'''
 import json
 import math
 import os
+import sys
 import time
 from unittest.mock import patch
 from pathlib import Path
-from qt_compat import QtWidgets, QtGui
+from qt_compat import QtWidgets, QtGui, QtCore
 from serial_ports import SerialPortScanner
 SerialPortScanner.list_ports = lambda self: ([], '')
 from sensor_window import MainWindow, CHANNEL_TABLE_COLUMN_INDEX
+from host_state_view import PARAMETER_GROUPS, JSON_ONLY_PARAMETERS
 app = QtWidgets.QApplication([])
+paint_errors = []
+def report_paint_error(*args):
+    import traceback
+    paint_errors.append(args)
+    traceback.print_exception(*args)
+sys.excepthook = report_paint_error
 for name in ('msyh.ttc', 'segoeui.ttf'):
     font = Path('C:/Windows/Fonts') / name
     if font.exists(): QtGui.QFontDatabase.addApplicationFont(str(font))
@@ -32,15 +40,25 @@ panel = window.host_state_settings
 engine = window.host_state_machine
 window.control_tabs.setCurrentWidget(panel)
 assert window.control_tabs.tabText(window.control_tabs.indexOf(panel)) == '基线与状态机'
-assert set(panel.inputs) == set(engine.parameters.settings())
+assert set(panel.inputs) == set(engine.parameters.settings()) - JSON_ONLY_PARAMETERS
+assert JSON_ONLY_PARAMETERS == {'normalization_floor', 'gap_seconds'}
+groups = panel.findChildren(QtWidgets.QGroupBox)
+assert [group.title() for group in groups] == [title for title, _ in PARAMETER_GROUPS]
+for group, (_, keys) in zip(groups, PARAMETER_GROUPS):
+    assert all(group.isAncestorOf(panel.inputs[key]) for key in keys)
+assert not any('上位机实验 · 20 通道独立状态' in label.text() for label in panel.findChildren(QtWidgets.QLabel))
 assert not panel.findChildren(QtWidgets.QTableWidget)
 assert window.table.rowCount() == 20
 assert panel.settings()['input_alpha'] == .2
+assert panel.settings()['signal_alpha'] == .1
+assert not panel.signal_filtered_box.isChecked()
 assert panel.settings()['initial_seconds'] == 3
 assert panel.inputs['slowback_tolerance_percent'].value() == 10
 assert panel.inputs['slowback_close_frames'].value() == 3
 assert panel.inputs['reload_reference_margin'].value() == 300
 assert all(not w.prefix() and not w.suffix() for w in panel.inputs.values())
+# 手动 JSON 设置的隐藏值在之后的应用、保存和重启中必须保留。
+panel.load_settings(dict(panel.settings(), normalization_floor=7.5, gap_seconds=.35))
 assert not window.touchpad.enabled_box.isChecked()
 assert panel.apply_button.text() == panel.bottom_apply_button.text() == '确认生效并保存'
 reason_col = CHANNEL_TABLE_COLUMN_INDEX['activation_reason']
@@ -93,6 +111,30 @@ assert bars.values[0] == engine.channels[0].input - 20000
 assert '上位机计算 Signal' in bars._message
 assert 'host_signal' not in window.data_buffer.latest_sensor_sample()
 assert bar_panel.maximum.value() == 20000
+# 在快照返回后模拟接收线程立即追加一帧，显示仍必须使用已处理的同帧结果。
+import threading
+sample(14000)
+captured_sequence = window.data_buffer.latest_sensor_sample()['sequence']
+original_snapshot = window.data_buffer.display_snapshot_after
+injections = []
+
+def receive_after_snapshot(sequence):
+    result = original_snapshot(sequence)
+    writer = threading.Thread(target=lambda: sample(14000))
+    writer.start();writer.join(1)
+    assert not writer.is_alive()
+    injections.append(True)
+    return result
+
+with patch.object(window.data_buffer, 'display_snapshot_after', side_effect=receive_after_snapshot):
+    refresh()
+assert injections
+assert window.data_buffer.latest_sensor_sample()['sequence'] == captured_sequence + 1
+assert bars._sample['sequence'] == engine.last_sequence == captured_sequence
+assert bars.values is not None and max(bars.values) > 0
+assert bars.values == tuple(c.signal for c in engine.channels)
+refresh()
+assert engine.last_sequence == bars._sample['sequence'] == captured_sequence + 1
 bar_panel.maximum.setValue(100000)
 assert bars.height_limit() == 100000
 bar_panel.source.setCurrentIndex(bar_panel.source.findData('raw'))
@@ -110,7 +152,7 @@ assert bars.height_limit() == 100000
 panel.waveform_button.click()
 refresh()
 assert window.waveform_source.currentData() == 'host'
-assert window.host_state_plot.isVisible()
+assert not window.host_state_plot.isVisible()
 assert window.value_labels['state'][0].text() == 'activate'
 reason_text = window.value_labels['activation_reason'][0].text()
 reason_detail = window.value_labels['activation_reason'][0].toolTip()
@@ -119,6 +161,74 @@ assert 'input' in reason_detail and 'baseline' in reason_detail and '3/3' in rea
 assert window.curves['raw'][0].getData()[1][-1] == engine.channels[0].input
 assert window.curves['baseline'][0].getData()[1][-1] == 20000
 assert window.curves['signal'][0].getData()[1][-1] == engine.channels[0].signal
+# 全窗口包含初始化的无效速度和按压上升沿；极值只统计有效采样。
+window.raw_plot.setXRange(0, len(engine.histories['fast'][0]) - 1, padding=0.)
+app.processEvents()
+valid_speeds = [v for v in engine.histories['fast'][0] if math.isfinite(v)]
+assert max(valid_speeds) > 0 and min(valid_speeds) == 0
+for name, expected in (('最大', max(valid_speeds)), ('最小', min(valid_speeds))):
+    line = window.speed_extrema_lines[name]
+    assert line.isVisible() and abs(line.value() - expected) < 1e-8
+    assert line.pen.style() == QtCore.Qt.PenStyle.DashLine
+    assert 'CH0' in line.label.format and '%/s' in line.label.format
+# 缩放到按压前的空载部分，旧上升峰必须离开统计窗口。
+window.raw_plot.setXRange(40, 120, padding=0.)
+app.processEvents()
+assert all(line.isVisible() and line.value() == 0 for line in window.speed_extrema_lines.values())
+window.plot_checkboxes['fast'][0].setChecked(False)
+assert all(not line.isVisible() for line in window.speed_extrema_lines.values())
+window.plot_checkboxes['fast'][0].setChecked(True)
+app.processEvents()
+assert all(line.isVisible() for line in window.speed_extrema_lines.values())
+# 可见范围完全没有采样点时隐藏，不沿用旧极值。
+window.raw_plot.setXRange(1000, 1100, padding=0.)
+app.processEvents()
+assert all(not line.isVisible() for line in window.speed_extrema_lines.values())
+window.auto_range()
+app.processEvents()
+# 显示开关同时切换波形、表格及柱状图，但不重算状态或触摸参考。
+before_generation = engine.generation
+before_version = engine.version
+before_touchpad_sequence = window.touchpad.last_sequence
+before_state = tuple(c.state for c in engine.channels)
+panel.signal_filtered_box.setChecked(True)
+refresh()
+assert engine.generation == before_generation and engine.version == before_version
+assert window.touchpad.last_sequence == before_touchpad_sequence
+assert tuple(c.state for c in engine.channels) == before_state
+assert bars.values == tuple(c.signal_filtered for c in engine.channels)
+assert '低通后' in bars._message
+assert window.curves['signal'][0].getData()[1][-1] == engine.channels[0].signal_filtered
+# 极小的真实滤波尾值仍保留，自动量程与手动缩放不能让刻度间距下溢成零。
+saved_signal_data = window.curves['signal'][0].getData()
+signal_view = window.signal_plot.getViewBox()
+signal_axis = window.signal_plot.getAxis('left')
+for tail in ([0., 0.], [5e-324, 1e-322], [2.5e-323, 2.5e-323], [0., 12000.]):
+    window.curves['signal'][0].setData([0, 1], tail)
+    window.auto_range()
+    signal_view.updateAutoRange()
+    app.processEvents()
+    low, high = signal_view.viewRange()[1]
+    assert math.isfinite(low) and math.isfinite(high) and high - low >= 1.
+    assert all(spacing > 0 for spacing, _ in signal_axis.tickValues(low, high, 200))
+    assert list(window.curves['signal'][0].getData()[1]) == tail
+    window.grab() # 强制真实 Qt 绘图，异常须由 excepthook 捕获。
+signal_view.setYRange(0., 1e-322, padding=0.)
+app.processEvents()
+assert signal_view.viewRange()[1][1] - signal_view.viewRange()[1][0] >= 1.
+assert not paint_errors, paint_errors
+window.curves['signal'][0].setData(*saved_signal_data)
+window.auto_range()
+assert window.value_labels['signal_value'][0].text() == f'{engine.channels[0].signal_filtered:.0f}'
+assert '低通后' in window.table.horizontalHeaderItem(CHANNEL_TABLE_COLUMN_INDEX['signal_value']).text()
+assert window.save_display_config()
+assert json.loads(window._config_path.read_text(encoding='utf-8'))['host_signal_filtered_display'] is True
+panel.signal_filtered_box.setChecked(False)
+refresh()
+assert bars.values == tuple(c.signal for c in engine.channels)
+assert window.curves['signal'][0].getData()[1][-1] == engine.channels[0].signal
+assert '低通前' in bars._message
+assert window.table.horizontalHeaderItem(CHANNEL_TABLE_COLUMN_INDEX['signal_value']).text() == 'Sig Val'
 assert math.isfinite(window.curves['fast'][0].getData()[1][-1])
 assert window.host_state_curve.getData()[1][-1] == 1
 assert 'Input' in window.table.horizontalHeaderItem(3).text()
@@ -134,6 +244,8 @@ for key in ('raw','baseline','signal','fast'):
     assert [i for i,c in enumerate(window.curves[key]) if c.isVisible()] == [19]
 assert window.curves['raw'][19].getData()[1][-1] == engine.channels[19].input
 assert window.host_state_curve.getData()[1][-1] == engine.channels[19].state
+app.processEvents()
+assert all('CH19' in line.label.format for line in window.speed_extrema_lines.values()), [(line.isVisible(), line.label.format) for line in window.speed_extrema_lines.values()]
 assert engine.generation == before_generation and engine.last_sequence == before_sequence
 window.state_background_channel_combo.setCurrentIndex(12)
 refresh()
@@ -167,16 +279,29 @@ refresh()
 assert engine.channels[0].state == 3
 assert bars.values == tuple(c.signal for c in engine.channels)
 assert bars.values == (0.,) * 20
+assert '激活0/20' in bars._message
 assert window.curves['signal'][0].getData()[1][-1] == 0
 assert window.value_labels['state'][0].text() == 'recover'
 assert window.host_state_curve.getData()[1][-1] == 3
-assert math.isnan(window.curves['fast'][0].getData()[1][-1])
-assert window.value_labels['fast_k_value'][0].text() == '--'
+assert math.isfinite(window.curves['fast'][0].getData()[1][-1])
+assert window.value_labels['fast_k_value'][0].text() == f'{engine.channels[0].rate:.2f}'
+app.processEvents()
+assert window.speed_extrema_lines['最小'].value() < 0
+assert window.speed_extrema_lines['最大'].value() > 0
 assert window.value_labels['activation_reason'][0].text() == reason_text
 assert window.value_labels['activation_reason'][0].toolTip() == reason_detail
+panel.signal_filtered_box.setChecked(True)
+refresh()
+assert engine.channels[0].signal == 0 and engine.channels[0].signal_filtered > 0
+assert bars.values == tuple(c.signal_filtered for c in engine.channels)
+assert window.value_labels['state'][0].text() == 'recover'
+assert window.curves['signal'][0].getData()[1][-1] == engine.channels[0].signal_filtered
+panel.signal_filtered_box.setChecked(False)
+refresh()
 window.waveform_source.setCurrentIndex(0)
 refresh()
 assert not window.host_state_plot.isVisible()
+assert all(not line.isVisible() for line in window.speed_extrema_lines.values())
 assert window.curves['raw'][0].getData()[1][-1] == 8000
 assert window.curves['baseline'][0].getData()[1][-1] == 9000
 assert window.data_buffer.snapshot()[5][0] == 6
@@ -205,6 +330,7 @@ sample() # 尚未被GUI消费的旧帧不得进入新初始化。
 assert panel.apply()
 assert not engine.histories['raw'][0]
 assert bars.values is None
+assert all(not line.isVisible() for line in window.speed_extrema_lines.values())
 refresh()
 assert engine.channels[0].started is None
 assert engine.parameters.drop_rate == 15
@@ -236,6 +362,7 @@ panel.inputs['drop_rate'].setValue(15)
 panel.inputs['window'].setValue(40)
 panel.inputs['reload_threshold'].setValue(800)
 panel.inputs['reload_reference_margin'].setValue(650)
+panel.inputs['signal_alpha'].setValue(.25)
 with patch.object(Path, 'replace', side_effect=PermissionError('test write denied')):
     assert not panel.apply()
 assert engine.parameters == before_parameters and engine.generation == before_generation
@@ -246,10 +373,12 @@ panel.bottom_apply_button.click()
 assert engine.parameters.drop_rate == 15 and engine.parameters.window == 40
 assert engine.parameters.reload_threshold == 800
 assert engine.parameters.reload_reference_margin == 650
+assert engine.parameters.signal_alpha == .25
 assert '已生效并保存' in panel.bottom_message.text()
 assert '实验参数已保存' in window.status_label.text() and '失败' not in window.status_label.text()
 confirmed_settings = panel.settings()
 assert json.loads(window._config_path.read_text(encoding='utf-8'))['host_state_machine'] == confirmed_settings
+panel.signal_filtered_box.setChecked(True)
 sample()
 refresh()
 assert engine.channels[0].input == 20000
@@ -282,6 +411,7 @@ assert bars.values == (0.,) * 20
 clock[0] += engine.parameters.gap_seconds + .01
 refresh()
 assert bars.values is None and '中断' in bars._message
+assert all(not line.isVisible() for line in window.speed_extrema_lines.values())
 sample()
 refresh()
 assert bars.values == (0.,) * 20
@@ -298,6 +428,7 @@ assert engine.channels[0].started is None
 assert window.data_buffer.snapshot()[0][0][-1] == 10000
 if os.environ.get('HOST_STATE_SCREENSHOT'):
     window.resize(1700,1000)
+    window._apply_font_size(16)
     window.control_tabs.setCurrentWidget(panel)
     panel.waveform_button.click()
     for index in range(340):
@@ -325,9 +456,17 @@ restarted = MainWindow()
 restarted.refresh_timer.stop()
 restarted._startup_connect_timer.stop()
 assert restarted.host_state_settings.settings() == confirmed_settings
+assert confirmed_settings['normalization_floor'] == 7.5
+assert confirmed_settings['gap_seconds'] == .35
 assert restarted.host_state_settings.inputs['window'].value() == 40
 assert restarted.host_state_settings.inputs['reload_threshold'].value() == 800
 assert restarted.host_state_settings.inputs['reload_reference_margin'].value() == 650
+assert restarted.host_state_settings.inputs['signal_alpha'].value() == .25
+assert restarted.host_state_settings.signal_filtered_box.isChecked()
+restarted._show_host_waveforms()
+app.processEvents()
+assert restarted.host_state_plot.isHidden()
+assert restarted.signal_plot.getViewBox().state['limits']['yRange'][0] == 1.
 assert restarted.host_state_settings.inputs['slowback_tolerance_percent'].value() == 7.5
 assert restarted.host_state_settings.inputs['slowback_close_frames'].value() == 4
 assert restarted.array_bar_settings.source.currentData() == 'host_signal'
@@ -335,6 +474,7 @@ assert restarted.array_bar_settings.maximum.value() == 100000
 assert restarted.array_bars.values is None
 restarted.close()
 app.processEvents()
+assert not paint_errors, paint_errors
 print('Host UI: full-rate processing, independent firmware data, plots, config, gain/session reset passed')
 '''
 

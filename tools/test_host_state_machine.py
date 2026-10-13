@@ -35,6 +35,49 @@ class Stream:
 
 
 class HostStateTests(unittest.TestCase):
+    def test_signal_lowpass_preserves_state_and_tracks_each_sample(self):
+        streams = [Stream(replace(HostParameters(), signal_alpha=alpha)) for alpha in (.1, 1.)]
+        previous = [0.] * 20
+        for value in [10000] * 305 + [14000] * 50 + [8000] * 40 + [16000] * 50:
+            filtered, original = [s.feed(value) for s in streams]
+            for key in ('input_val', 'baseline', 'signal', 'state', 'activation_events', 'release_reference'):
+                self.assertEqual(filtered[key], original[key])
+            self.assertEqual(original['signal_filtered'], original['signal'])
+            for index in range(20):
+                expected = previous[index] + .1 * (filtered['signal'][index] - previous[index])
+                self.assertAlmostEqual(filtered['signal_filtered'][index], expected)
+            previous = filtered['signal_filtered']
+        s = streams[0]
+        self.assertEqual(s.model.histories['signal_filtered'][0][-1], previous[0])
+        version = s.model.version
+        duplicate = dict(sequence=s.sequence, sample_timestamp=s.time, has_raw=True,
+                         channel_count=20, raw=[20000] * 20)
+        self.assertIsNone(s.model.feed(duplicate))
+        self.assertEqual(s.model.version, version)
+        self.assertEqual(s.model.channels[0].signal_filtered, previous[0])
+        s.model.reset()
+        self.assertEqual(s.model.channels[0].signal_filtered, 0)
+        self.assertFalse(s.model.histories['signal_filtered'][0])
+
+    def test_signal_lowpass_release_tail_disabled_and_parameter_validation(self):
+        s = Stream(replace(HostParameters(), input_alpha=1., signal_alpha=.25, release_frames=1))
+        s.model.set_gains([1., 0.] + [1.] * 18)
+        s.initialize()
+        s.repeat(14000, 40)
+        previous = s.model.channels[0].signal_filtered
+        frame = s.feed(10000)
+        self.assertEqual(frame['signal'][0], 0)
+        self.assertNotEqual(frame['state'][0], 1)
+        self.assertAlmostEqual(frame['signal_filtered'][0], previous * .75)
+        self.assertEqual(frame['signal_filtered'][1], 0)
+        for invalid in (0., -1., 1.01, math.nan):
+            with self.assertRaises(ValueError):
+                replace(HostParameters(), signal_alpha=invalid)
+        self.assertEqual(HostParameters.from_settings({'input_alpha': .1}).signal_alpha, .1)
+        s.time += .3
+        frame = s.feed()
+        self.assertEqual(frame['signal_filtered'], [0.] * 20)
+
     def test_gain_before_lowpass_and_initial_max(self):
         p = replace(HostParameters(), initial_seconds=.05)
         stream = Stream(p)
@@ -100,36 +143,57 @@ class HostStateTests(unittest.TestCase):
         self.assertEqual(c.state, 0)
         self.assertLess(abs(c.baseline - c.input), s.model.parameters.recover_tolerance)
 
-    def test_rate_only_exposed_when_active_and_idle_skips_regression(self):
+    def test_realtime_rate_once_per_sample_in_idle_active_and_recovery(self):
         s = Stream(replace(HostParameters(), slowback_frames=3))
         s.initialize()
         c = s.model.channels[0]
         with patch.object(c, 'slope_rate', wraps=c.slope_rate) as regression:
             s.repeat(10000, 30)
-            self.assertEqual(regression.call_count, 0)
+            self.assertEqual(regression.call_count, 30)
             self.assertEqual(len(c.history), s.model.parameters.window)
-            self.assertTrue(math.isnan(c.rate) and math.isnan(c.decision_rate))
-            for _ in range(20):
+            self.assertEqual(c.rate, 0.)
+            self.assertTrue(math.isnan(c.decision_rate))
+            regression.reset_mock()
+            for index in range(20):
                 frame = s.feed(14000)
                 if c.state == 1:
                     break
             self.assertEqual(c.state, 1)
-            self.assertEqual(regression.call_count, 1)
+            self.assertEqual(regression.call_count, index + 1)
             self.assertTrue(math.isfinite(c.rate))
             self.assertEqual(frame['pressure_rate'][0], c.decision_rate)
         s.repeat(14000, 30)
         while c.state == 1:
             frame = s.feed(8000)
         self.assertEqual(c.state, 2)
-        self.assertTrue(math.isnan(frame['pressure_rate'][0]))
+        self.assertTrue(math.isfinite(frame['pressure_rate'][0]))
         self.assertTrue(math.isfinite(frame['decision_rate'][0]))
         for _ in range(20):
             frame = s.feed(8000)
             self.assertIn(c.state, (2, 3))
-            self.assertTrue(math.isnan(c.rate))
-            self.assertTrue(math.isnan(s.model.histories['fast'][0][-1]))
-            self.assertTrue(math.isnan(frame['pressure_rate'][0]))
+            self.assertTrue(math.isfinite(c.rate))
+            self.assertEqual(s.model.histories['fast'][0][-1], c.rate)
+            self.assertTrue(math.isfinite(frame['pressure_rate'][0]))
             self.assertTrue(math.isfinite(frame['decision_rate'][0]))
+
+    def test_realtime_rate_during_initialization_and_irregular_idle_sampling(self):
+        s = Stream(replace(HostParameters(), input_alpha=1., activate_threshold=10000.))
+        for index in range(25):
+            frame = s.feed(10000)
+            self.assertEqual(frame['state'][0], -1)
+            if index < 19:
+                self.assertTrue(math.isnan(frame['pressure_rate'][0]))
+            else:
+                self.assertEqual(frame['pressure_rate'][0], 0.)
+        s.initialize()
+        started = s.time
+        for index in range(40):
+            interval = (.003, .008, .005, .011)[index % 4]
+            s.time += interval - s.dt
+            frame = s.feed(10000 + 250 * (s.time + s.dt - started))
+        self.assertEqual(frame['state'][0], 0)
+        self.assertAlmostEqual(frame['pressure_rate'][0], 100 * 250 / frame['input_val'][0], places=8)
+        self.assertTrue(math.isnan(frame['decision_rate'][0]))
 
     def test_slowback_early_recover_relative_band_both_sides_and_gains(self):
         for gain in (1., 2.):

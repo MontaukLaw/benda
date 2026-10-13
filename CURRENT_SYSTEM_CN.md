@@ -1,8 +1,10 @@
 # 当前实现与文档入口
 
-核对日期：2026-09-22。本文对应当前工作区源码，不代表板上已烧录同一版本。历史实验、旧协议及CHANGE.md中的过去记录保留原始结论，不作为当前配置依据。
+综合功能核对日期：2026-09-22；通信协议与构建入口补充核对日期：2026-10-05。本文对应工作区源码，不代表板上已烧录同一版本。历史实验、旧协议及CHANGE.md中的过去记录保留原始结论，不作为当前配置依据。
 
-2026-10-04临时覆盖：默认 `SENSOR_ALGO_BASELINE_ENABLED=0`，固件直接发送Raw，运行时Baseline/Signal及触摸判定暂停；上位机接收端补Baseline/Signal为0，GUI保留，在“3D柱状图→柱状图设置”选择“Raw Val”。宏设为1重新编译恢复完整算法，下文压力与标定功能描述针对完整算法模式。UART新增Type 0x16载荷`2*N`字节，见[协议说明](UART_PROTOCOL_UNIFIED_V3_CN.md)。I2C帧长改为按通道数计算，食指20通道90字节，拇指/小指五通道仍45字节；外部食指I2C接收端须读取90字节。仅编译生成固件，未烧录或打包EXE。
+当前通信配置：Makefile默认`RAW_ONLY=0`，使用V21 `DATA`协议；`SENSOR_ALGO_BASELINE_ENABLED`默认为0，采样发送Type `0x16`，食指20通道总长50字节、拇指/小指5通道20字节。上位机补Baseline/Signal为0、未上传状态为-1、K为NaN；这些不是测量结果。在“3D柱状图→柱状图设置”选择“Raw Val”。宏设为1恢复通道算法，但20点矩阵仍仅输出Signal/Debug，不输出旧四通道力，也不使用旧FLOATING锁定；下文旧食指压力标定及高低力换算不适用于当前20点矩阵。完整帧和适用范围见[协议说明](UART_PROTOCOL_UNIFIED_V3_CN.md)。
+
+显式`RAW_ONLY=1`使用`raw_stream.c`的46字节`AA 55 AA 55`协议，配套独立接收脚本，原GUI不能接收，见[RAW20说明](RAW20_SERIAL_CN.md)。I2C当前由`app_iic.c`实现`55 AA`、版本3帧，食指20通道90字节、拇指/小指5通道45字节；接收端须按对应通道数读取，见[I2C说明](SENSOR_BUS_PROTOCOL_CN.md)。本次仅更新文档。
 
 ## 当前功能
 
@@ -14,7 +16,7 @@
 
 - 监控页“四通道Raw统计与施力响应”为独立折叠模块，位于“实时通道数据”下方，包含接收模式、Raw统计和固定参考采集/清除及响应显示。默认折叠，展开状态自动保存；隐藏不停止采样或清除参考。
 - 算法UART为 **V21**，沿用V20单一硬件Raw布局；上位机兼容V14～V21。I²C/SensorBus为独立协议，不随UART版本号递增。
-- INDEX_FINGER启动三参数为`Nsub=300、TxDivider=100、RefCDAC=30`；手动修改仅在RAM。通道状态运行时切换仅由`commit_state()`提交，其他模块消费真实状态。
+- INDEX_FINGER当前使用Configurator的20点矩阵生成配置，不执行旧固定参数覆盖；本次核对为`Nsub=200、TxDivider=100、RefCDAC=30`，以逐通道回读为准。手动修改仅在RAM。通道状态运行时切换仅由`commit_state()`提交，其他模块消费真实状态。
 - 新电机监控寻压与压力反馈页共用控制器、参数和有效学习表。学习表是电脑上的压力—行程参考，支持插值接近及反馈微调，**不是传感器K表，不写入传感器MCU Flash**。重启后经新鲜卸载反馈核验恢复。
 - “电机位置/压力标定”旧Tab已隐藏。监控页自动标定分三阶段：30 N热身（至少5次、最多15次，到位后恒力5秒再采样、释放后休息10秒不可跳过）→10/20整数点正式标定（默认5轮）→历史/本次误差点各补测3次并冻结候选表独立逐点验收（最多3批）。热身须通过最近3次收敛门槛，精度默认±2%且至少±0.05 N，可设置；正式/复测点间休息默认30秒、0～3600秒可设及跳过。节点保留真实Signal/压力配对，未通过先释放并保留原表；阶段、逐轮耗时和误差有记录及显示。详见[三阶段说明](HIGH_FORCE_CALIBRATION_CN.md)。
 - 微力采用独立手动四点表和检测线。新高力表有效、Signal达到首节点且换算达到1 N时，食指MCU的UART主法向输出采用高力插值；原48点表仍可存取，48是容量，不是当前自动标定点数。I²C输出须按独立协议理解，不能套用UART微力量程标志。
@@ -63,6 +65,7 @@
 | 微力四点、检测线与输出 | [LOW_FORCE_CALIBRATION_CN.md](LOW_FORCE_CALIBRATION_CN.md) |
 | UART V21命令与帧 | [UART_PROTOCOL_UNIFIED_V3_CN.md](UART_PROTOCOL_UNIFIED_V3_CN.md)，文件名保留历史名称 |
 | V20/V21单一Raw布局 | [RAW_PROTOCOL_V20_CN.md](RAW_PROTOCOL_V20_CN.md)，V21沿用V20布局 |
+| 显式RAW_ONLY=1的独立46字节采集 | [RAW20_SERIAL_CN.md](RAW20_SERIAL_CN.md)，与V21 Type 0x16不同 |
 | 真实状态机 | [MACHINE_STATE.md](MACHINE_STATE.md) |
 | 变体、三参数与构建 | [FIRMWARE_VARIANTS_CN.md](FIRMWARE_VARIANTS_CN.md) |
 | 压力控制与学习恢复 | [PRESSURE_FEEDBACK_CONTROL_CN.md](PRESSURE_FEEDBACK_CONTROL_CN.md)、[新电机按力下压](PY_SRIPT/algo_monitor/ZDT_FORCE_PRESS_CN.md) |

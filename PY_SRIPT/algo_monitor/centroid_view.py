@@ -3,6 +3,7 @@ import math
 import time
 
 from qt_compat import QtCore, QtGui, QtWidgets
+from font_scale import scaled_font_size
 from centroid_filter import CHANNEL_GRID, CentroidFilter
 
 
@@ -75,10 +76,10 @@ class CentroidView(QtWidgets.QWidget):
         painter.fillRect(self.rect(), QtGui.QColor('#080d13'))
         painter.setPen(QtGui.QColor('#d9e7f0'))
         title_font = QtGui.QFont(self.font())
-        title_font.setPointSize(13)
+        title_font.setPointSize(scaled_font_size(self, 13))
         title_font.setBold(True)
         painter.setFont(title_font)
-        painter.drawText(QtCore.QRectF(24, 16, self.width() - 48, 28),
+        painter.drawText(QtCore.QRectF(24, 16, self.width() - 48, max(28,painter.fontMetrics().height()+4)),
                          QtCore.Qt.AlignmentFlag.AlignCenter, '4 × 5 传感阵列')
 
         grid, cell = self.grid_geometry()
@@ -93,14 +94,14 @@ class CentroidView(QtWidgets.QWidget):
             painter.drawLine(QtCore.QPointF(left, y), QtCore.QPointF(grid.right(), y))
 
         label_font = QtGui.QFont(self.font())
-        label_font.setPixelSize(max(6, min(13, int(cell / 4))))
+        label_font.setPixelSize(scaled_font_size(self, max(6, min(13, int(cell / 4)))))
         painter.setFont(label_font)
         painter.setPen(QtGui.QColor('#9bb7ca'))
         for row, channels in enumerate(CHANNEL_GRID):
             for col, channel in enumerate(channels):
                 inset = min(8, cell * .08)
                 label = QtCore.QRectF(left + col * cell + inset, top + row * cell + inset,
-                                     cell - inset * 2, min(24, cell * .4))
+                                     cell - inset * 2, min(max(24,painter.fontMetrics().height()+4), cell * .5))
                 painter.drawText(label, QtCore.Qt.AlignmentFlag.AlignLeft |
                                  QtCore.Qt.AlignmentFlag.AlignVCenter, f'CH{channel}')
 
@@ -112,5 +113,6 @@ class CentroidView(QtWidgets.QWidget):
 
         painter.setPen(QtGui.QColor('#9bb7ca'))
         painter.setFont(self.font())
-        painter.drawText(QtCore.QRectF(16, self.height() - 44, self.width() - 32, 28),
+        height = max(28,painter.fontMetrics().height()+4)
+        painter.drawText(QtCore.QRectF(16, self.height() - height - 16, self.width() - 32, height),
                          QtCore.Qt.AlignmentFlag.AlignCenter, self._message)
