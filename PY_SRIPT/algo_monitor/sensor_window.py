@@ -17,7 +17,7 @@ from watch_face_view import WatchFaceCanvas, WatchFacePanel
 from array_bar_view import ArrayBarView, ArrayBarPanel
 from raw_gain_calibration_view import RawGainCalibrationPanel
 from raw_gain import RAW_GAIN_MAX
-from host_state_machine import HostStateMachine, HOST_STATE_NAMES, HOST_STATE_COLORS
+from host_state_machine import HostStateMachine, HOST_STATE_NAMES, HOST_STATE_COLORS, HOST_RECOVERY_STATES
 from host_state_view import HostStatePanel, format_activation_reason
 from slide_test_view import SlideTestPanel
 from data_recorder import SerialDataRecorder
@@ -234,7 +234,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.host_state_plot = pg.PlotWidget(title='上位机实验状态 · 所选背景通道', background='#080d13')
         self.host_state_plot.setLabel('bottom', '采样帧')
         self.host_state_plot.getAxis('left').setTicks([list(HOST_STATE_NAMES.items())])
-        self.host_state_plot.setYRange(-2.5, 3.5)
+        self.host_state_plot.setYRange(-2.5, 5.5)
         self.host_state_plot.setXLink(self.raw_plot)
         self.host_state_curve = self.host_state_plot.plot(pen=pg.mkPen('#63d8ef', width=2), stepMode='left')
         graph_layout.addWidget(self.host_state_plot, 1)
@@ -726,7 +726,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 filtered = self.host_state_settings.signal_filtered_box.isChecked()
                 values = tuple(channel.signal_filtered if filtered else channel.signal for channel in engine.channels)
                 active = sum(channel.state == 1 for channel in engine.channels)
-                recovering = sum(channel.state in (2, 3) for channel in engine.channels)
+                recovering = sum(channel.state in HOST_RECOVERY_STATES for channel in engine.channels)
                 message += f' · 激活{active}/20 · 恢复{recovering}/20'
                 message += (f' · 低通后 alpha={engine.parameters.signal_alpha:g}' if filtered else ' · 低通前')
             sample = dict(sample, host_signal=values, host_signal_message=message)

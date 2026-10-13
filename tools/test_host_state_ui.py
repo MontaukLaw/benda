@@ -20,7 +20,8 @@ from qt_compat import QtWidgets, QtGui, QtCore
 from serial_ports import SerialPortScanner
 SerialPortScanner.list_ports = lambda self: ([], '')
 from sensor_window import MainWindow, CHANNEL_TABLE_COLUMN_INDEX
-from host_state_view import PARAMETER_GROUPS, JSON_ONLY_PARAMETERS
+from host_state_view import PARAMETER_GROUPS, JSON_ONLY_PARAMETERS, format_activation_reason
+from host_state_machine import HOST_STATE_NAMES, HOST_STATE_COLORS, HOST_STATE_IDLE_NEGATIVE, HOST_STATE_RELEASE_UNDERSHOOT
 app = QtWidgets.QApplication([])
 paint_errors = []
 def report_paint_error(*args):
@@ -41,13 +42,57 @@ engine = window.host_state_machine
 window.control_tabs.setCurrentWidget(panel)
 assert window.control_tabs.tabText(window.control_tabs.indexOf(panel)) == '基线与状态机'
 assert set(panel.inputs) == set(engine.parameters.settings()) - JSON_ONLY_PARAMETERS
-assert JSON_ONLY_PARAMETERS == {'normalization_floor', 'gap_seconds'}
-groups = panel.findChildren(QtWidgets.QGroupBox)
+assert JSON_ONLY_PARAMETERS == {'normalization_floor', 'gap_seconds', 'channel_repress'}
+panel.config_tabs.setCurrentIndex(0)
+groups = panel.parameter_groups
 assert [group.title() for group in groups] == [title for title, _ in PARAMETER_GROUPS]
 for group, (_, keys) in zip(groups, PARAMETER_GROUPS):
     assert all(group.isAncestorOf(panel.inputs[key]) for key in keys)
+assert all(group.body.isHidden() for group in groups)
+before_generation = engine.generation
+before_parameters = engine.parameters
+panel.expand_all_button.click()
+assert all(not group.body.isHidden() for group in groups)
+panel.inputs['reload_reference_margin'].setValue(450)
+groups[-1].toggle.click()
+assert groups[-1].body.isHidden()
+assert panel.inputs['reload_reference_margin'].value() == 450
+groups[-1].toggle.click()
+assert not groups[-1].body.isHidden()
+panel.inputs['reload_reference_margin'].setValue(300)
+panel.collapse_all_button.click()
+assert all(group.body.isHidden() for group in groups)
+assert engine.generation == before_generation and engine.parameters == before_parameters
 assert not any('上位机实验 · 20 通道独立状态' in label.text() for label in panel.findChildren(QtWidgets.QLabel))
-assert not panel.findChildren(QtWidgets.QTableWidget)
+assert panel.channel_table.rowCount() == 10
+assert panel.channel_table.columnCount() == 8
+# 独立页按左右两组显示20通道，并占用剩余高度，无页面/表格纵向滚动。
+from host_state_view import HostStatePanel
+from host_state_machine import HostStateMachine
+preview = HostStatePanel(HostStateMachine())
+preview.resize(1180, 650)
+preview.show()
+app.processEvents()
+assert preview.config_tabs.currentIndex() == 1
+assert preview.verticalScrollBar().maximum() == 0
+assert preview.channel_table.verticalScrollBar().maximum() == 0
+assert preview.channel_table.item(9, 4).text() == 'CH19'
+preview.channel_table.setCurrentCell(4, 4)
+assert preview._selected_channels() == [14]
+preview.channel_table.clearSelection()
+preview.channel_table.setCurrentCell(4, 0)
+assert preview._selected_channels() == [4]
+# 无采样参考时旧毫秒配置仅撤销对应覆盖，保留公共参数和其他通道设置。
+preview.load_settings(dict(preview.settings(), idle_alpha=.003,
+    channel_repress={'4': {'margin':450, 'confirm_ms':100},
+                     '5': {'margin':400, 'confirm_frames':7}}))
+assert preview.settings()['idle_alpha'] == .003
+assert preview.settings()['channel_repress'] == {'5': {'margin':400., 'confirm_frames':7.}}
+assert 'CH4' in preview.message.text()
+preview.close()
+
+assert len(panel.channel_inputs) == 20
+assert all(not widget.prefix() and not widget.suffix() for row in panel.channel_inputs for widget in row[1:])
 assert window.table.rowCount() == 20
 assert panel.settings()['input_alpha'] == .2
 assert panel.settings()['signal_alpha'] == .1
@@ -57,6 +102,22 @@ assert panel.inputs['slowback_tolerance_percent'].value() == 10
 assert panel.inputs['slowback_close_frames'].value() == 3
 assert panel.inputs['reload_reference_margin'].value() == 300
 assert all(not w.prefix() and not w.suffix() for w in panel.inputs.values())
+assert panel.inputs['negative_threshold'].value() == 200
+assert panel.inputs['negative_frames'].value() == 3
+assert panel.inputs['negative_rebase_seconds'].value() == 5
+assert panel.inputs['negative_press_margin'].value() == 300
+assert panel.inputs['negative_press_rate'].value() == 20
+assert panel.inputs['negative_press_frames'].value() == 3
+assert '空闲负向扰动' in HOST_STATE_NAMES[HOST_STATE_IDLE_NEGATIVE]
+assert HOST_STATE_IDLE_NEGATIVE in HOST_STATE_COLORS
+summary, detail = format_activation_reason(dict(
+    from_state=HOST_STATE_IDLE_NEGATIVE, reason='negative_recovery_press',
+    confirmed_frames=3, required_frames=3, activation_number=1,
+    input_val=10500, baseline=10000, difference=500, activate_threshold=200,
+    negative_reference=10000, reference_difference=500))
+assert '超过原零点' in summary and '受力前参考' in detail
+assert window.host_state_plot.getViewBox().viewRange()[1][1] > HOST_STATE_RELEASE_UNDERSHOOT
+assert HOST_STATE_RELEASE_UNDERSHOOT in HOST_STATE_COLORS
 # 手动 JSON 设置的隐藏值在之后的应用、保存和重启中必须保留。
 panel.load_settings(dict(panel.settings(), normalization_floor=7.5, gap_seconds=.35))
 assert not window.touchpad.enabled_box.isChecked()
@@ -276,13 +337,13 @@ panel.observation_channel.setCurrentIndex(0)
 refresh()
 for _ in range(15): sample(8000)
 refresh()
-assert engine.channels[0].state == 3
+assert engine.channels[0].state == HOST_STATE_RELEASE_UNDERSHOOT
 assert bars.values == tuple(c.signal for c in engine.channels)
 assert bars.values == (0.,) * 20
 assert '激活0/20' in bars._message
 assert window.curves['signal'][0].getData()[1][-1] == 0
-assert window.value_labels['state'][0].text() == 'recover'
-assert window.host_state_curve.getData()[1][-1] == 3
+assert window.value_labels['state'][0].text() == HOST_STATE_NAMES[HOST_STATE_RELEASE_UNDERSHOOT]
+assert window.host_state_curve.getData()[1][-1] == HOST_STATE_RELEASE_UNDERSHOOT
 assert math.isfinite(window.curves['fast'][0].getData()[1][-1])
 assert window.value_labels['fast_k_value'][0].text() == f'{engine.channels[0].rate:.2f}'
 app.processEvents()
@@ -294,7 +355,7 @@ panel.signal_filtered_box.setChecked(True)
 refresh()
 assert engine.channels[0].signal == 0 and engine.channels[0].signal_filtered > 0
 assert bars.values == tuple(c.signal_filtered for c in engine.channels)
-assert window.value_labels['state'][0].text() == 'recover'
+assert window.value_labels['state'][0].text() == HOST_STATE_NAMES[HOST_STATE_RELEASE_UNDERSHOOT]
 assert window.curves['signal'][0].getData()[1][-1] == engine.channels[0].signal_filtered
 panel.signal_filtered_box.setChecked(False)
 refresh()
@@ -307,15 +368,15 @@ assert window.curves['baseline'][0].getData()[1][-1] == 9000
 assert window.data_buffer.snapshot()[5][0] == 6
 assert window.value_labels['activation_reason'][0].text() == '--'
 assert '固件协议未上报' in window.value_labels['activation_reason'][0].toolTip()
-# 真正重新按压后，监控原因须显示新增加的卸载前参考及余量证据。
+# 负向恢复后真正重新按压，监控原因显示保留的原零点。
 panel.waveform_button.click()
 for _ in range(15): sample(16000)
 refresh()
 assert engine.channels[0].state == 1
-assert engine.channels[0].last_activation['reason'] == 'reload'
-assert engine.channels[0].last_activation['release_reference'] == 20000
+assert engine.channels[0].last_activation['reason'] == 'negative_recovery_press'
+assert engine.channels[0].last_activation['negative_reference'] == 20000
 reload_detail = window.value_labels['activation_reason'][0].toolTip()
-assert '卸载前参考基线' in reload_detail and '超出参考门限 300.000' in reload_detail
+assert '受力前参考 20000.000' in reload_detail and '超出参考' in reload_detail
 panel.inputs['release_threshold'].setValue(300)
 before = engine.generation
 assert not panel.apply()
@@ -362,7 +423,23 @@ panel.inputs['drop_rate'].setValue(15)
 panel.inputs['window'].setValue(40)
 panel.inputs['reload_threshold'].setValue(800)
 panel.inputs['reload_reference_margin'].setValue(650)
+panel.inputs['negative_press_margin'].setValue(700)
+panel.inputs['negative_press_rate'].setValue(45)
+panel.inputs['negative_press_frames'].setValue(4)
 panel.inputs['signal_alpha'].setValue(.25)
+# 批量填写只编辑草稿；保存失败不得改变运行参数。
+panel.channel_table.setCurrentCell(4, 0)
+panel.batch_margin.setValue(450)
+panel.batch_duration.setValue(120)
+panel._fill_channels()
+assert panel.channel_inputs[4][0].isChecked()
+assert not engine.parameters.channel_repress
+panel.channel_table.clearSelection()
+panel.channel_table.setCurrentCell(5, 0)
+panel._fill_channels()
+panel._inherit_channels()
+assert not panel.channel_inputs[5][0].isChecked()
+assert not panel.channel_inputs[5][1].isEnabled()
 with patch.object(Path, 'replace', side_effect=PermissionError('test write denied')):
     assert not panel.apply()
 assert engine.parameters == before_parameters and engine.generation == before_generation
@@ -458,9 +535,16 @@ restarted._startup_connect_timer.stop()
 assert restarted.host_state_settings.settings() == confirmed_settings
 assert confirmed_settings['normalization_floor'] == 7.5
 assert confirmed_settings['gap_seconds'] == .35
+assert restarted.host_state_settings.channel_inputs[4][0].isChecked()
+assert restarted.host_state_settings.channel_inputs[4][1].value() == 450
+assert restarted.host_state_settings.channel_inputs[4][2].value() == 120
+assert restarted.host_state_settings.settings()['channel_repress'] == {'4': {'margin':450., 'confirm_frames':120.}}
 assert restarted.host_state_settings.inputs['window'].value() == 40
 assert restarted.host_state_settings.inputs['reload_threshold'].value() == 800
 assert restarted.host_state_settings.inputs['reload_reference_margin'].value() == 650
+assert restarted.host_state_settings.inputs['negative_press_margin'].value() == 700
+assert restarted.host_state_settings.inputs['negative_press_rate'].value() == 45
+assert restarted.host_state_settings.inputs['negative_press_frames'].value() == 4
 assert restarted.host_state_settings.inputs['signal_alpha'].value() == .25
 assert restarted.host_state_settings.signal_filtered_box.isChecked()
 restarted._show_host_waveforms()

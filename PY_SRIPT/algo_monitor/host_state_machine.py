@@ -1,15 +1,19 @@
 """可见的上位机实验状态机；不读写或替代固件通道状态。"""
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 
 from raw_gain import normalize_raw_gains, apply_raw_gains
 
+HOST_STATE_IDLE_NEGATIVE = 4
+HOST_STATE_RELEASE_UNDERSHOOT = 5
+HOST_NEGATIVE_STATES = (HOST_STATE_IDLE_NEGATIVE, HOST_STATE_RELEASE_UNDERSHOOT)
+HOST_RECOVERY_STATES = (2, 3, *HOST_NEGATIVE_STATES)
 HOST_STATE_ACTIVATE = 1
 HOST_STATE_NAMES = {-2: 'disabled', -1: '初始化', 0: 'idle', HOST_STATE_ACTIVATE: 'activate',
-                    2: 'slowback', 3: 'recover'}
+                    2: 'slowback', 3: 'recover', 4: '空闲负向扰动', 5: '释放下冲'}
 HOST_STATE_COLORS = {-2: '#444444', -1: '#49324e', 0: '#204f3b',
-                     1: '#764821', 2: '#245779', 3: '#535087'}
+                     1: '#764821', 2: '#245779', 3: '#535087', 4: '#426575', 5: '#75538a'}
 
 # 键、标签、默认值、最小值、最大值、小数位。全部单位放在标签中。
 PARAMETERS = (
@@ -26,6 +30,12 @@ PARAMETERS = (
     ('slowback_frames', 'slowback 最长保持（采样帧）', 300, 1, 100000, 0),
     ('slowback_tolerance_percent', 'slowback 提前恢复相对基线差值（%）', 10., 0., 100., 3),
     ('slowback_close_frames', 'slowback 提前恢复连续确认（帧）', 3, 1, 10000, 0),
+    ('negative_threshold', '负向下冲进入差值（count）', 200., .001, 65535000., 2),
+    ('negative_frames', '负向下冲进入连续确认（帧）', 3, 1, 10000, 0),
+    ('negative_rebase_seconds', 'recover 残余平台持续稳定时间（秒）', 5., .1, 600., 2),
+    ('negative_press_margin', '负向下冲再按超出原零点（count）', 300., 0., 65535000., 2),
+    ('negative_press_rate', '负向下冲再按上升速度（%/s）', 20., .001, 100000., 3),
+    ('negative_press_frames', '负向下冲再按连续确认（帧）', 3, 1, 10000, 0),
     ('idle_alpha', 'idle 基线跟踪 alpha', .002, .000001, 1., 6),
     ('recover_alpha', 'recover 基线跟踪 alpha', .1, .000001, 1., 6),
     ('recover_tolerance', '恢复允许基线差值（count）', 20., 0., 65535000., 2),
@@ -55,6 +65,12 @@ class HostParameters:
     slowback_frames: int = 300
     slowback_tolerance_percent: float = 10.
     slowback_close_frames: int = 3
+    negative_threshold: float = 200.
+    negative_frames: int = 3
+    negative_rebase_seconds: float = 5.
+    negative_press_margin: float = 300.
+    negative_press_rate: float = 20.
+    negative_press_frames: int = 3
     idle_alpha: float = .002
     recover_alpha: float = .1
     recover_tolerance: float = 20.
@@ -67,6 +83,8 @@ class HostParameters:
     normalization_floor: float = 1.
     gap_seconds: float = .2
 
+    channel_repress: dict = field(default_factory=dict)
+
     def __post_init__(self):
         for key, _, _, low, high, decimals in PARAMETERS:
             value = getattr(self, key)
@@ -76,17 +94,34 @@ class HostParameters:
                 raise ValueError(f'{key} 必须为整数')
             if decimals == 0:
                 object.__setattr__(self, key, int(value))
+        if not isinstance(self.channel_repress, dict):
+            raise ValueError('通道独立配置须为对象')
+        normalized = {}
+        for channel, values in self.channel_repress.items():
+            index = int(channel)
+            if str(index) != str(channel) or not 0 <= index < 20:
+                raise ValueError('通道编号必须为0至19')
+            if not isinstance(values, dict) or set(values) != {'margin', 'confirm_frames'}:
+                raise ValueError('通道独立配置需要增量与确认时长')
+            margin, duration = float(values['margin']), float(values['confirm_frames'])
+            if not math.isfinite(margin) or not 0 <= margin <= 65535000:
+                raise ValueError('再按压增量超出范围')
+            if not math.isfinite(duration) or not 1 <= duration <= 10000 or duration != int(duration):
+                raise ValueError('连续确认须为1至10000整数帧')
+            normalized[str(index)] = dict(margin=margin, confirm_frames=duration)
+        object.__setattr__(self, 'channel_repress', normalized)
         if self.release_threshold >= self.activate_threshold:
             raise ValueError('慢速释放差值必须小于激活差值')
         if self.recover_alpha < self.idle_alpha:
             raise ValueError('recover alpha 必须不小于 idle alpha')
 
     def settings(self):
-        return {key: getattr(self, key) for key, *_ in PARAMETERS}
+        return dict({key: getattr(self, key) for key, *_ in PARAMETERS},
+                    channel_repress={key: dict(value) for key, value in self.channel_repress.items()})
 
     @classmethod
     def from_settings(cls, settings):
-        return cls(**{key: settings[key] for key, *_ in PARAMETERS if key in settings})
+        return cls(**{key: settings[key] for key in (*[row[0] for row in PARAMETERS], 'channel_repress') if key in settings})
 
 
 class _Channel:
@@ -101,47 +136,101 @@ class _Channel:
         self.activate_count = self.drop_count = self.release_count = 0
         self.reload_count = self.recover_count = self.hold_count = 0
         self.close_count = 0
+        self.negative_count = 0
+        self.negative_stable_since = None
+        self.negative_min = self.negative_max = 0.
         self.trough = 0.
         self.release_reference = None
         self.activation_number = 0
         self.last_activation = None
+        self.repress_override = None
+        # 恢复来源仅用于选择真实下冲状态，原参考与局部下降参考各自独立。
+        self.recovery_source = None
+        self.had_negative = False
+        self.recovery_high = 0.
+
 
     def commit_state(self, state, activation=None):
         # 运行时状态仅由此入口提交，同时集中复位确认计数。
         if state == self.state:
             return
+        # 每轮首次按压锁定可信零点，再次加载不得继承更低的恢复基线。
+        previous_state = self.state
+        if state == HOST_STATE_ACTIVATE:
+            self.recovery_source = 'release'
+            self.had_negative = False
+            self.baseline = (self.release_reference if self.release_reference is not None
+                             else self.baseline)
+            self.release_reference = self.baseline
         if state == 1 and activation is not None:
             self.activation_number += 1
             self.last_activation = dict(activation, from_state=self.state,
                                         activation_number=self.activation_number)
-        # 同一恢复周期保留卸载前基线的最高值，防止下冲或反复重新加载降低回弹门槛。
-        if state == 2 and self.state == 1:
-            self.release_reference = max(self.baseline, self.release_reference
-                                         if self.release_reference is not None else self.baseline)
-        elif state in (-2, 0):
+        # 本轮参考只在首次进入时建立，恢复中的高低平台都不能改写它。
+        if state in (-2, 0):
             self.release_reference = None
+            self.recovery_source = None
+            self.had_negative = False
+        # 负向形变保存原零点，重新按压后继续用于卸载保护。
+        if state in HOST_NEGATIVE_STATES:
+            self.had_negative = True
+            self.recovery_source = 'idle' if state == HOST_STATE_IDLE_NEGATIVE else 'release'
+            if self.release_reference is None:
+                self.release_reference = self.baseline
+            self.baseline = self.release_reference
+        self.negative_count = 0
+        self.negative_stable_since = None
         self.state = state
         self.activate_count = self.drop_count = self.release_count = 0
         self.reload_count = self.recover_count = self.hold_count = 0
         self.close_count = 0
         self.trough = self.input
+        # 下冲结束后的新下降必须相对本地平台重新积累，不能再次使用旧零点残差。
+        self.recovery_high = (max(self.input, self.baseline)
+                              if state == 2 and previous_state == HOST_STATE_ACTIVATE else self.input)
 
     def activation_evidence(self, timestamp, rate, p):
         # 在提交状态、清空计数及谷值前保存本次真正通过的判据。
         reloading = self.state in (2, 3)
-        evidence = dict(reason='reload' if reloading else 'idle_threshold',
-                        sample_timestamp=timestamp, input_val=self.input, baseline=self.baseline,
-                        difference=self.input - self.baseline,
+        negative_press = self.state in HOST_NEGATIVE_STATES or (reloading and self.had_negative)
+        baseline = self.release_reference if self.release_reference is not None else self.baseline
+        evidence = dict(reason=('negative_recovery_press' if negative_press
+                                else 'reload' if reloading else 'idle_threshold'),
+                        sample_timestamp=timestamp, input_val=self.input, baseline=baseline,
+                        difference=self.input - baseline,
                         activate_threshold=p.activate_threshold, pressure_rate=rate,
                         confirmed_frames=self.reload_count if reloading else self.activate_count,
                         required_frames=p.reload_frames if reloading else p.activate_frames)
+        if negative_press:
+            evidence.update(negative_source=self.recovery_source, negative_reference=self.release_reference,
+                            reference_difference=self.input - self.release_reference,
+                            negative_press_margin=p.negative_press_margin,
+                            negative_press_rate=p.negative_press_rate,
+                            negative_press_frames=p.negative_press_frames,
+                            required_frames=p.negative_press_frames)
         if reloading:
             reference = self.release_reference if self.release_reference is not None else self.baseline
             evidence.update(trough=self.trough, increase=self.input - self.trough,
-                            reload_threshold=p.reload_threshold, reload_rate=p.reload_rate,
+                            reload_threshold=p.reload_threshold,
+                            reload_rate=p.negative_press_rate if negative_press else p.reload_rate,
                             release_reference=reference, reference_difference=self.input-reference,
-                            reload_reference_margin=p.reload_reference_margin)
+                            reload_reference_margin=p.negative_press_margin if negative_press else p.reload_reference_margin)
+        if self.repress_override is not None and self.state in HOST_RECOVERY_STATES:
+            if negative_press:
+                evidence['negative_press_margin'] = self.repress_override['margin']
+            if reloading:
+                evidence['reload_reference_margin'] = self.repress_override['margin']
+            else:
+                evidence['negative_press_margin'] = self.repress_override['margin']
+            evidence.update(repress_margin=self.repress_override['margin'],
+                            required_frames=self.repress_override['confirm_frames'],
+                            parameter_source='channel_override')
         return evidence
+
+    def confirm_repress(self, candidate, timestamp, count, frames):
+        # 沿用各入口连续帧计数；任一条件失效时调用方将计数清零。
+        required = self.repress_override['confirm_frames'] if self.repress_override else frames
+        return candidate and count >= required
 
     def slope_rate(self, p):
         if len(self.history) < p.window or self.input < p.normalization_floor:
@@ -157,7 +246,8 @@ class _Channel:
                     for t, (_, v) in zip(times, self.history)) / variance
         return 100. * slope / self.input
 
-    def feed(self, raw, timestamp, enabled, p):
+    def feed(self, raw, timestamp, enabled, p, repress_override=None):
+        self.repress_override = repress_override
         self.decision_rate = math.nan
         if not enabled:
             self.commit_state(-2)
@@ -178,16 +268,45 @@ class _Channel:
             if timestamp - self.started >= p.initial_seconds:
                 self.commit_state(0)
             return
-        # 状态判定沿用原入口，idle 的实时观察速度不参与激活条件。
-        rate = self.rate if self.state in (1, 2, 3) else math.nan
+        # idle 激活只检查差值；负向恢复还使用实时速度确认稳定。
+        rate = self.rate if self.state in (1, *HOST_RECOVERY_STATES) else math.nan
         difference = self.input - self.baseline
         if self.state == 0:
+            # 从首个明显下沉候选起冻结基线，确认期间保住原零点。
+            if difference < -p.negative_threshold:
+                self.negative_count += 1
+                self.activate_count = 0
+                if self.negative_count >= p.negative_frames:
+                    self.commit_state(HOST_STATE_IDLE_NEGATIVE)
+                return
+            self.negative_count = 0
             self.activate_count = self.activate_count + 1 if difference > p.activate_threshold else 0
             if self.activate_count >= p.activate_frames:
                 rate = self.rate
                 self.commit_state(1, self.activation_evidence(timestamp, rate, p))
             elif not self.activate_count:
                 self.baseline += p.idle_alpha * difference
+        elif self.state in HOST_NEGATIVE_STATES:
+            # 原零点继续保护再按压；负向状态只描述下降阶段，不负责长期零点恢复。
+            reference = self.release_reference
+            difference = self.input - reference
+            pressing = (difference > max(p.activate_threshold, repress_override['margin'] if repress_override else p.negative_press_margin)
+                        and math.isfinite(rate) and rate >= p.negative_press_rate)
+            self.activate_count = self.activate_count + 1 if pressing else 0
+            if self.confirm_repress(pressing, timestamp, self.activate_count, p.negative_press_frames):
+                self.commit_state(1, self.activation_evidence(timestamp, rate, p))
+            else:
+                # 快速再按候选优先；下降减弱或开始回升后连续确认退出。
+                ended = math.isfinite(rate) and rate >= -p.stable_rate and not pressing
+                self.recover_count = self.recover_count + 1 if ended else 0
+                if self.recover_count >= p.recover_frames:
+                    if abs(difference) <= p.recover_tolerance and abs(rate) <= p.stable_rate:
+                        self.baseline = reference
+                        self.commit_state(0)
+                    elif self.state == HOST_STATE_RELEASE_UNDERSHOOT and rate > p.stable_rate:
+                        self.commit_state(2)
+                    else:
+                        self.commit_state(3)
         elif self.state == 1:
             self.drop_count = self.drop_count + 1 if rate <= -p.drop_rate else 0
             self.release_count = self.release_count + 1 if difference < p.release_threshold else 0
@@ -196,16 +315,41 @@ class _Channel:
         elif self.state in (2, 3):
             self.trough = min(self.trough, self.input)
             reference = self.release_reference if self.release_reference is not None else self.baseline
+            # 低于原参考的经历保留再按保护，但不因此强行切回下冲状态。
+            if reference - self.input > p.negative_threshold:
+                self.had_negative = True
+            # 仅新的明显下降才重新进入负向状态；处于旧零点下方本身不构成下冲。
+            falling = math.isfinite(rate) and rate < -p.stable_rate
+            new_drop = (falling and self.recovery_high - self.input > p.negative_threshold
+                        and reference - self.input > p.negative_threshold)
+            self.negative_count = self.negative_count + 1 if new_drop else 0
+            if new_drop:
+                self.negative_stable_since = None
+                self.reload_count = self.recover_count = self.close_count = 0
+                if self.negative_count >= p.negative_frames:
+                    self.commit_state(HOST_STATE_IDLE_NEGATIVE if self.recovery_source == 'idle'
+                                      else HOST_STATE_RELEASE_UNDERSHOOT)
+                self.decision_rate = rate
+                return
+            # 平稳平台推进局部参考，缓慢漂移不会沿用历史高点重复触发。
+            if math.isfinite(rate) and abs(rate) <= p.stable_rate:
+                self.recovery_high = self.input
+            elif self.input > self.recovery_high:
+                self.recovery_high = self.input
             # 回到原释放基线以下的快速回弹继续恢复；越过基线后才冻结新加载候选。
-            guard_enabled = p.reload_reference_margin > 0
-            rising_candidate = (rate >= p.reload_rate
+            negative_cycle = self.had_negative
+            margin = repress_override['margin'] if repress_override else (p.negative_press_margin if negative_cycle else p.reload_reference_margin)
+            reload_rate = p.negative_press_rate if negative_cycle else p.reload_rate
+            reload_frames = p.negative_press_frames if negative_cycle else p.reload_frames
+            guard_enabled = margin > 0
+            rising_candidate = (rate >= reload_rate
                                 and (not guard_enabled or self.input > reference))
             reloading = (rising_candidate
-                         and self.input - self.trough > p.reload_threshold
-                         and difference > p.activate_threshold
-                         and (not guard_enabled or self.input > reference + p.reload_reference_margin))
+                         and (negative_cycle or self.input - self.trough > p.reload_threshold)
+                         and self.input - reference > p.activate_threshold
+                         and (not guard_enabled or self.input > reference + margin))
             self.reload_count = self.reload_count + 1 if reloading else 0
-            if self.reload_count >= p.reload_frames:
+            if self.confirm_repress(reloading, timestamp, self.reload_count, reload_frames):
                 self.commit_state(1, self.activation_evidence(timestamp, rate, p))
             elif self.state == 2:
                 self.hold_count += 1
@@ -222,11 +366,35 @@ class _Channel:
                 self.baseline += p.recover_alpha * difference
                 stable = (abs(self.input - self.baseline) <= p.recover_tolerance
                           and abs(rate) <= p.stable_rate)
-                self.recover_count = self.recover_count + 1 if stable else 0
+                if stable and self.input < reference - p.recover_tolerance:
+                    self.had_negative = True
+                near_reference = abs(self.input - reference) <= p.recover_tolerance
+                # 普通释放保留原有快速恢复；经历负向形变后按原零点保护完成确认。
+                reference_stable = (abs(rate) <= p.stable_rate and near_reference
+                                    if self.had_negative else stable and self.input >= reference - p.recover_tolerance)
+                self.recover_count = self.recover_count + 1 if reference_stable else 0
                 if self.recover_count >= p.recover_frames:
+                    if self.had_negative:
+                        self.baseline = reference
                     self.commit_state(0)
+                elif abs(rate) <= p.stable_rate and not near_reference:
+                    # 原参考保留到平台连续稳定完成，工作基线跟随不代表零点已经提交。
+                    if self.negative_stable_since is None:
+                        self.negative_stable_since = timestamp
+                        self.negative_min = self.negative_max = self.input
+                    self.negative_min = min(self.negative_min, self.input)
+                    self.negative_max = max(self.negative_max, self.input)
+                    if self.negative_max - self.negative_min > p.recover_tolerance:
+                        self.negative_stable_since = timestamp
+                        self.negative_min = self.negative_max = self.input
+                    elif timestamp - self.negative_stable_since >= p.negative_rebase_seconds:
+                        self.baseline = self.input
+                        self.commit_state(0)
+                else:
+                    self.negative_stable_since = None
             else:
                 self.recover_count = 0
+                self.negative_stable_since = None
         # 单独保存本帧参与判定的速度；公开速度持续输出，不受真实状态切换遮蔽。
         self.decision_rate = rate
         if self.state == 1:
@@ -300,7 +468,8 @@ class HostStateMachine:
         activation_events = []
         for index, (channel, value, gain) in enumerate(zip(self.channels, values, self.gains)):
             activation_number = channel.activation_number
-            channel.feed(value, timestamp, gain > 0, self.parameters)
+            channel.feed(value, timestamp, gain > 0, self.parameters,
+                         self.parameters.channel_repress.get(str(index)))
             # 显示低通逐采样更新，包含释放后的零值；不反馈到基线、速度或状态判定。
             if gain > 0:
                 channel.signal_filtered += self.parameters.signal_alpha * (channel.signal - channel.signal_filtered)
@@ -320,7 +489,9 @@ class HostStateMachine:
                      pressure_rate=[c.rate for c in self.channels],
                      decision_rate=[c.decision_rate for c in self.channels],
                      release_reference=[c.release_reference for c in self.channels],
-                     state=[c.state for c in self.channels])
+                     state=[c.state for c in self.channels],
+                     recovery_source=[c.recovery_source for c in self.channels],
+                     state_schema_version=2)
         for key, source in (('raw', 'input_val'), ('baseline', 'baseline'), ('signal', 'signal'),
                             ('signal_filtered', 'signal_filtered'),
                             ('fast', 'pressure_rate'), ('state', 'state')):

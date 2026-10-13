@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'PY_SRIPT/algo_monitor'))
-from host_state_machine import HostParameters, HostStateMachine
+from host_state_machine import HostParameters, HostStateMachine, HOST_STATE_IDLE_NEGATIVE, HOST_STATE_RELEASE_UNDERSHOOT, HOST_NEGATIVE_STATES
 
 
 class Stream:
@@ -35,6 +35,183 @@ class Stream:
 
 
 class HostStateTests(unittest.TestCase):
+    def test_recovery_platform_never_raises_original_reference(self):
+        s = Stream(replace(HostParameters(), input_alpha=1., window=2,
+                           drop_frames=1, slowback_frames=1))
+        s.initialize()
+        s.repeat(14000, 10)
+        c = s.model.channels[0]
+        s.feed(11000)
+        s.feed(11000)
+        s.feed(11000)
+        self.assertGreater(c.baseline, 10000)
+        self.assertEqual(c.release_reference, 10000)
+        s.repeat(8000, 4)
+        self.assertEqual(c.state, 3)
+        self.assertEqual(c.release_reference, 10000)
+        self.assertEqual(c.release_reference, 10000)
+
+    def test_negative_press_parameters_and_continuous_confirmation(self):
+        p = replace(HostParameters(), input_alpha=1., window=2,
+                    negative_press_margin=600., negative_press_rate=40., negative_press_frames=2)
+        s = Stream(p)
+        s.initialize()
+        s.repeat(8000, 10)
+        c = s.model.channels[0]
+        # 快速上涨但幅度不足；幅度足够但速度不足，都不能激活。
+        s.feed(10500)
+        self.assertEqual(c.reload_count, 0)
+        s.repeat(10500, 5)
+        for v in (10610, 10620, 10630):
+            s.feed(v)
+            self.assertEqual(c.state, 3)
+        s.feed(11500)
+        self.assertEqual(c.reload_count, 1)
+        s.feed(11500)
+        self.assertEqual(c.reload_count, 0)
+        s.feed(12500)
+        f = s.feed(13500)
+        self.assertEqual(c.state, 1)
+        event = f['activation_events'][0]
+        self.assertEqual(event['negative_press_margin'], 600)
+        self.assertEqual(event['negative_press_rate'], 40)
+        self.assertEqual(event['required_frames'], 2)
+        self.assertEqual(event['confirmed_frames'], 2)
+
+    def test_positive_residual_platform_can_settle_without_slow_activation(self):
+        s = Stream(replace(HostParameters(), input_alpha=1., window=2))
+        s.initialize()
+        s.repeat(8000, 10)
+        for v in range(8000, 11001, 10):
+            s.feed(v)
+        s.repeat(11000, 600)
+        c = s.model.channels[0]
+        self.assertEqual(c.state, 0)
+        self.assertEqual(c.baseline, 11000)
+        self.assertEqual(c.activation_number, 0)
+
+    def test_release_undershoot_then_slow_rebound_does_not_latch_active(self):
+        for hz in (70, 100, 200):
+            s = Stream(replace(HostParameters(), input_alpha=1., window=2,
+                               drop_frames=1, slowback_frames=1), hz)
+            s.initialize()
+            s.repeat(14000, 10)
+            c = s.model.channels[0]
+            self.assertEqual(c.release_reference, 10000)
+            s.repeat(7500, 20)
+            self.assertEqual(c.state, 3)
+            self.assertEqual(c.release_reference, 10000)
+            # 下冲后缓慢回升到原零点以下，不能制造假 Signal。
+            for i in range(round(hz*3)):
+                frame = s.feed(7500 + 2400*i/(hz*3))
+                self.assertNotEqual(c.state, 1)
+                self.assertEqual(frame['signal'][0], 0)
+                self.assertEqual(c.release_reference, 10000)
+            s.repeat(10000, 40)
+            self.assertEqual(c.state, 0)
+            self.assertIsNone(c.release_reference)
+
+    def test_small_recover_undershoot_cannot_clear_original_reference(self):
+        s = Stream(replace(HostParameters(), input_alpha=1., window=2,
+                           drop_frames=1, slowback_frames=1))
+        s.initialize()
+        s.repeat(14000, 10)
+        s.repeat(9900, 80)
+        c = s.model.channels[0]
+        self.assertEqual(c.state, 3)
+        self.assertEqual(c.release_reference, 10000)
+        self.assertEqual(c.release_reference, 10000)
+        s.repeat(10000, 20)
+        self.assertEqual(c.state, 0)
+
+    def test_negative_recovery_rejects_slow_rise_and_keeps_fast_long_hold(self):
+        s = Stream(replace(HostParameters(), input_alpha=1., window=2,
+                           drop_frames=1, slowback_frames=1))
+        s.initialize()
+        s.repeat(14000, 10)
+        s.repeat(8000, 20)
+        c = s.model.channels[0]
+        self.assertEqual(c.state, 3)
+        for i in range(300):
+            s.feed(8000 + 10*i)
+        self.assertEqual(c.state, 3)
+        self.assertEqual(c.signal, 0)
+        for value in (13000, 14000, 15000):
+            s.feed(value)
+        self.assertEqual(c.state, 1)
+        self.assertEqual(c.release_reference, 10000)
+        self.assertIn(c.last_activation['reason'], ('reload', 'negative_recovery_press'))
+        s.repeat(15000, 1200)
+        self.assertEqual(c.state, 1)
+        self.assertEqual(c.signal, 5000)
+        s.repeat(8000, 20)
+        self.assertEqual(c.release_reference, 10000)
+        self.assertEqual(c.release_reference, 10000)
+
+    def test_negative_recovery_freezes_candidate_and_repeated_rebounds(self):
+        s = Stream(replace(HostParameters(), input_alpha=1.))
+        s.initialize()
+        s.feed(8000)
+        self.assertEqual(s.model.channels[0].baseline, 10000)
+        self.assertEqual(s.model.channels[0].state, 0)
+        s.repeat(8000, 3)
+        self.assertEqual(s.model.channels[0].state, HOST_STATE_IDLE_NEGATIVE)
+        for value in [8000]*30 + [9700]*40 + [7500]*20 + [9900]*40:
+            f = s.feed(value)
+            self.assertNotEqual(f['state'][0], 1)
+            self.assertEqual(f['signal'][0], 0)
+            self.assertEqual(f['release_reference'][0], 10000)
+        s.repeat(10000, 40)
+        self.assertEqual(s.model.channels[0].state, 0)
+        self.assertIsNone(s.model.channels[0].release_reference)
+
+    def test_negative_recovery_real_press_and_other_channel(self):
+        s = Stream(replace(HostParameters(), input_alpha=1.))
+        s.initialize()
+        for _ in range(30):
+            raw = [10000]*20
+            raw[8], raw[11] = 8000, 14000
+            s.feed(raw=raw)
+        self.assertEqual(s.model.channels[8].state, 3)
+        self.assertEqual(s.model.channels[11].state, 1)
+        for _ in range(3):
+            raw[8] = 10500
+            f = s.feed(raw=raw)
+        self.assertEqual(f['state'][8], 1)
+        self.assertEqual(f['signal'][8], 500)
+        event = next(e for e in f['activation_events'] if e['channel'] == 8)
+        self.assertEqual(event['reason'], 'negative_recovery_press')
+        self.assertEqual(event['negative_reference'], 10000)
+        self.assertEqual(event['from_state'], 3)
+
+    def test_negative_rebase_requires_continuous_narrow_platform(self):
+        for hz in (70, 100, 200):
+            s = Stream(replace(HostParameters(), input_alpha=1.), hz=hz)
+            s.initialize()
+            s.repeat(8000, round(hz*2))
+            self.assertEqual(s.model.channels[0].release_reference, 10000)
+            # 低速持续回升也不能被当成稳定低平台。
+            for i in range(round(hz*6)):
+                s.feed(8000 + 10*i/hz)
+                self.assertEqual(s.model.channels[0].release_reference, 10000)
+            s.repeat(8060, round(hz*6))
+            self.assertEqual(s.model.channels[0].state, 0)
+            self.assertAlmostEqual(s.model.channels[0].baseline, 8060)
+
+    def test_negative_gap_and_disable_clear_reference(self):
+        s = Stream(replace(HostParameters(), input_alpha=1.))
+        s.initialize()
+        s.repeat(8000, 30)
+        self.assertEqual(s.model.channels[0].release_reference, 10000)
+        s.time += .3
+        f = s.feed(8000)
+        self.assertEqual(f['state'][0], -1)
+        self.assertIsNone(f['release_reference'][0])
+        s.model.set_gains([0.] + [1.]*19)
+        f = s.feed(8000)
+        self.assertEqual(f['state'][0], -2)
+        self.assertIsNone(f['release_reference'][0])
+
     def test_signal_lowpass_preserves_state_and_tracks_each_sample(self):
         streams = [Stream(replace(HostParameters(), signal_alpha=alpha)) for alpha in (.1, 1.)]
         previous = [0.] * 20
@@ -87,6 +264,9 @@ class HostStateTests(unittest.TestCase):
         self.assertEqual(stream.model.channels[0].input, 20400.)
         self.assertEqual(stream.model.channels[0].baseline, 20400.)
         stream.repeat(9000, 8)
+        self.assertEqual(stream.model.channels[0].state, HOST_STATE_IDLE_NEGATIVE)
+        self.assertEqual(stream.model.channels[0].baseline, 20400.)
+        stream.repeat(9000, 600)
         self.assertEqual(stream.model.channels[0].state, 0)
         self.assertLess(stream.model.channels[0].baseline, 20400.)
         self.assertEqual(stream.model.channels[1].state, -2)
@@ -126,19 +306,19 @@ class HostStateTests(unittest.TestCase):
         s.repeat(14000, 40)
         baseline = s.model.channels[0].baseline
         while s.model.channels[0].state == 1:
-            s.feed(8000)
+            s.feed(10000)
         c = s.model.channels[0]
         self.assertEqual(c.state, 2)
         self.assertEqual(c.signal, 0)
         self.assertEqual(c.baseline, baseline)
-        s.repeat(8000, 299)
+        s.repeat(10000, 299)
         self.assertEqual(c.state, 2)
         self.assertEqual(c.baseline, baseline)
-        s.feed(8000)
+        s.feed(10000)
         self.assertEqual(c.state, 3)
         self.assertEqual(c.baseline, baseline)
         for _ in range(100):
-            s.feed(8000)
+            s.feed(10000)
             self.assertEqual(c.signal, 0)
         self.assertEqual(c.state, 0)
         self.assertLess(abs(c.baseline - c.input), s.model.parameters.recover_tolerance)
@@ -170,7 +350,7 @@ class HostStateTests(unittest.TestCase):
         self.assertTrue(math.isfinite(frame['decision_rate'][0]))
         for _ in range(20):
             frame = s.feed(8000)
-            self.assertIn(c.state, (2, 3))
+            self.assertIn(c.state, (2, 3, *HOST_NEGATIVE_STATES))
             self.assertTrue(math.isfinite(c.rate))
             self.assertEqual(s.model.histories['fast'][0][-1], c.rate)
             self.assertTrue(math.isfinite(frame['pressure_rate'][0]))
@@ -199,7 +379,7 @@ class HostStateTests(unittest.TestCase):
         for gain in (1., 2.):
             for target, outside in ((11000, 11100), (9000, 12000)):
                 with self.subTest(gain=gain, target=target):
-                    s = Stream(replace(HostParameters(), input_alpha=1., window=2, drop_frames=1))
+                    s = Stream(replace(HostParameters(), input_alpha=1., window=2, drop_frames=1, negative_threshold=5000))
                     s.model.set_gains([gain] * 20)
                     s.initialize()
                     s.repeat(16000, 5)
@@ -282,7 +462,7 @@ class HostStateTests(unittest.TestCase):
         self.assertEqual(p.slowback_close_frames, 3)
         self.assertEqual(p.reload_reference_margin, 300.)
 
-    def test_undershoot_rebound_tracks_without_reload_at_multiple_rates_and_gains(self):
+    def test_undershoot_rebound_preserves_reference_at_multiple_rates_and_gains(self):
         for hz in (70, 100, 200):
             for gain in (1., 2.):
                 with self.subTest(hz=hz, gain=gain):
@@ -292,23 +472,14 @@ class HostStateTests(unittest.TestCase):
                     s.repeat(14000, 40)
                     c = s.model.channels[0]
                     original = c.baseline
-                    while c.state == 1:
-                        s.feed(6000)
+                    s.repeat(6000, 50)
+                    self.assertIn(c.state, (3, HOST_STATE_RELEASE_UNDERSHOOT))
                     self.assertEqual(c.release_reference, original)
-                    s.repeat(6000, 20)
-                    self.assertEqual(c.state, 3)
-                    self.assertLess(c.baseline, original)
-                    recovering_rise = 0
+                    self.assertEqual(c.release_reference, original)
                     for _ in range(120):
-                        before = c.baseline
                         frame = s.feed(10000)
-                        self.assertIn(c.state, (0, 3))
+                        self.assertIn(c.state, (0, 2, 3, HOST_STATE_RELEASE_UNDERSHOOT))
                         self.assertEqual(c.signal, 0)
-                        if c.state == 3 and c.decision_rate >= s.model.parameters.reload_rate:
-                            recovering_rise += 1
-                            self.assertGreater(c.baseline, before)
-                            self.assertEqual(frame['release_reference'][0], original)
-                    self.assertGreater(recovering_rise, 0)
                     self.assertEqual(c.state, 0)
                     self.assertIsNone(c.release_reference)
 
@@ -316,7 +487,7 @@ class HostStateTests(unittest.TestCase):
         for margin in (200., 800.):
             with self.subTest(margin=margin):
                 p = replace(HostParameters(), input_alpha=1., window=2, drop_frames=1,
-                            slowback_frames=1, reload_threshold=100., reload_reference_margin=margin)
+                            negative_threshold=10000, slowback_frames=1, reload_threshold=100., reload_reference_margin=margin)
                 s = Stream(p)
                 s.initialize()
                 s.repeat(14000, 5)
@@ -333,7 +504,7 @@ class HostStateTests(unittest.TestCase):
                 self.assertEqual(c.baseline, frozen)
                 for increment in (100., 200., 300.):
                     s.feed(reference+margin+increment)
-                    self.assertEqual(c.baseline, frozen)
+                    self.assertEqual(c.baseline, reference if c.state == 1 else frozen)
                 self.assertEqual(c.state, 1)
                 evidence = c.last_activation
                 self.assertEqual(evidence['release_reference'], reference)
@@ -347,21 +518,18 @@ class HostStateTests(unittest.TestCase):
                 s.model.reset()
                 self.assertIsNone(s.model.channels[0].release_reference)
 
-    def test_zero_reference_margin_restores_legacy_reload_below_reference(self):
+    def test_zero_reload_margin_does_not_disable_negative_recovery(self):
         s = Stream(replace(HostParameters(), input_alpha=1., window=2, drop_frames=1,
                            slowback_frames=1, reload_threshold=100., reload_reference_margin=0.))
         s.initialize()
         s.repeat(14000, 5)
         c = s.model.channels[0]
-        reference = c.baseline
-        s.feed(6000)
-        s.feed(6000)
-        s.repeat(6000, 5)
+        s.repeat(6000, 10)
         for value in (9500, 9600, 9700):
             s.feed(value)
-        self.assertEqual(c.state, 1)
-        self.assertLess(c.input, reference)
-        self.assertEqual(c.last_activation['reload_reference_margin'], 0.)
+        self.assertEqual(c.state, 3)
+        self.assertEqual(c.release_reference, 10000)
+        self.assertEqual(c.signal, 0)
 
     def test_rate_uses_irregular_timestamps(self):
         s = Stream(replace(HostParameters(), input_alpha=1., drop_rate=1000.))
@@ -390,7 +558,7 @@ class HostStateTests(unittest.TestCase):
     def test_reload_in_both_hold_and_recover(self):
         for state in (2, 3):
             with self.subTest(state=state):
-                s = Stream(replace(HostParameters(), slowback_frames=30))
+                s = Stream(replace(HostParameters(), slowback_frames=30, negative_threshold=10000))
                 s.initialize()
                 s.repeat(14000, 40)
                 while s.model.channels[0].state == 1:
@@ -405,7 +573,7 @@ class HostStateTests(unittest.TestCase):
                     if c.decision_rate >= s.model.parameters.reload_rate and frozen is None:
                         frozen = c.baseline
                     if frozen is not None:
-                        self.assertEqual(c.baseline, frozen)
+                        self.assertEqual(c.baseline, max(frozen, c.release_reference) if c.state == 1 else frozen)
                     if c.state == 1:
                         break
                 self.assertEqual(c.state, 1)
@@ -441,7 +609,7 @@ class HostStateTests(unittest.TestCase):
             result = s.feed(8000)
             self.assertEqual(result['activation_events'], [])
         self.assertEqual(c.last_activation, saved)
-        s.repeat(8000, 400)
+        s.repeat(8000, 650)
         self.assertEqual(c.state, 0)
         self.assertEqual(c.last_activation, saved)
         self.assertNotEqual(c.baseline, saved['baseline'])
@@ -451,7 +619,7 @@ class HostStateTests(unittest.TestCase):
 
     def test_recover_requires_stability_not_only_proximity(self):
         s = Stream(replace(HostParameters(), recover_alpha=1., slowback_frames=1,
-                           reload_rate=100000., stable_rate=.001))
+                           reload_rate=100000., stable_rate=.001, negative_threshold=10000))
         s.initialize()
         s.repeat(14000, 40)
         while s.model.channels[0].state == 1:
@@ -505,6 +673,131 @@ class HostStateTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 replace(HostParameters(), **change)
 
+
+class NegativeStateRoutingTests(unittest.TestCase):
+    def stream(self):
+        stream = Stream(replace(HostParameters(), input_alpha=1., window=4,
+                                negative_frames=2, recover_frames=3, drop_frames=1))
+        stream.initialize()
+        return stream
+
+    def test_idle_disturbance_is_separate_from_other_channel_press(self):
+        stream = self.stream()
+        for value in (9500, 9000, 8500):
+            frame = stream.feed(raw=[value, 14000] + [10000]*18)
+        self.assertEqual(frame['state'][0], HOST_STATE_IDLE_NEGATIVE)
+        self.assertEqual(frame['state'][1], 1)
+        self.assertEqual(frame['recovery_source'][0], 'idle')
+        self.assertEqual(frame['state_schema_version'], 2)
+        stream.repeat(8500, 20)
+        self.assertEqual(stream.model.channels[0].state, 3)
+        self.assertEqual(stream.model.channels[0].release_reference, 10000)
+
+    def test_release_undershoot_bounces_to_slowback_then_recover(self):
+        stream = self.stream()
+        stream.repeat(14000, 20)
+        c = stream.model.channels[0]
+        states=[]
+        for value in (9500, 9000, 8500, 8000):
+            states.append(stream.feed(value)['state'][0])
+        self.assertIn(HOST_STATE_RELEASE_UNDERSHOOT, states)
+        self.assertNotIn(HOST_STATE_IDLE_NEGATIVE, states)
+        self.assertEqual(c.recovery_source, 'release')
+        for value in (8200, 8400, 8600, 8800, 9000, 9200, 9400):
+            states.append(stream.feed(value)['state'][0])
+            self.assertEqual(c.signal, 0)
+            self.assertEqual(c.release_reference, 10000)
+        self.assertIn(2, states[-5:])
+        stream.repeat(9400, 40)
+        self.assertEqual(c.state, 3)
+        self.assertLess(abs(c.baseline-9400), 20)
+        self.assertEqual(c.release_reference, 10000)
+
+    def test_low_platform_and_gentle_drift_do_not_reenter_negative(self):
+        for origin in ('idle','release'):
+            stream=self.stream()
+            if origin=='release':
+                stream.repeat(14000, 20)
+            for value in (9500, 9000, 8500, 8000):
+                stream.feed(value)
+            stream.repeat(8000, 50)
+            c=stream.model.channels[0]
+            self.assertEqual(c.state, 3)
+            for index in range(150):
+                stream.feed(8000-.1*index)
+                self.assertEqual(c.state, 3)
+                self.assertEqual(c.release_reference, 10000)
+                self.assertEqual(c.signal, 0)
+            # 第二次下降需要新的局部增量与下降沿，来源仍沿用本轮真实来源。
+            states=[]
+            for value in (7700, 7400, 7100, 6800):
+                states.append(stream.feed(value)['state'][0])
+            expected=HOST_STATE_IDLE_NEGATIVE if origin=='idle' else HOST_STATE_RELEASE_UNDERSHOOT
+            self.assertIn(expected, states)
+
+    def test_exit_confirmation_and_near_zero_direct_idle(self):
+        stream=Stream(replace(HostParameters(), input_alpha=1., window=2,
+                             negative_frames=2, recover_frames=3))
+        stream.initialize()
+        stream.feed(9500)
+        stream.feed(9000)
+        c=stream.model.channels[0]
+        self.assertEqual(c.state, HOST_STATE_IDLE_NEGATIVE)
+        stream.repeat(9000, 2)
+        self.assertEqual(c.state, HOST_STATE_IDLE_NEGATIVE)
+        stream.feed(9000)
+        self.assertEqual(c.state, 3)
+        stream.repeat(10000, 15)
+        self.assertEqual(c.state, 0)
+        self.assertIsNone(c.release_reference)
+        self.assertIsNone(c.recovery_source)
+
+class ChannelRepressTests(unittest.TestCase):
+    def test_restore_and_validation(self):
+        p = HostParameters(channel_repress={'4': {'margin': 450, 'confirm_frames': 10}})
+        self.assertEqual(HostParameters.from_settings(p.settings()), p)
+        for count in (0, 1.5, 10001):
+            with self.assertRaises(ValueError):
+                HostParameters(channel_repress={'4': {'margin':300, 'confirm_frames':count}})
+
+    def test_all_entries_confirm_exact_frames_at_different_rates(self):
+        for state in (2, 3, *HOST_NEGATIVE_STATES):
+            for hz in (100, 200):
+                with self.subTest(state=state, hz=hz):
+                    p = HostParameters(input_alpha=1, window=2,
+                        channel_repress={'4': {'margin':300, 'confirm_frames':10}})
+                    stream = Stream(p, hz)
+                    stream.initialize()
+                    for c in stream.model.channels:
+                        c.commit_state(state)
+                        c.release_reference = c.baseline = c.trough = 10000
+                    for i in range(30):
+                        stream.feed(10400 + 4000*i/hz)
+                        c = stream.model.channels[4]
+                        if c.state == 1:
+                            self.assertEqual(c.last_activation['confirmed_frames'], 10)
+                            self.assertEqual(c.last_activation['required_frames'], 10)
+                            break
+                    else:
+                        self.fail('未按连续帧数激活')
+                    self.assertEqual(stream.model.channels[5].state, 1)
+
+    def test_cancelled_candidate_resets_count(self):
+        p = HostParameters(input_alpha=1, window=2,
+            channel_repress={'4': {'margin':300, 'confirm_frames':10}})
+        stream = Stream(p)
+        stream.initialize()
+        c=stream.model.channels[4]
+        c.commit_state(HOST_STATE_IDLE_NEGATIVE)
+        c.release_reference = c.baseline = 10000
+        for i in range(6):
+            stream.feed(10400 + 40*i)
+        self.assertNotEqual(c.state, 1)
+        stream.feed(10000)
+        self.assertEqual(c.activate_count, 0)
+        for i in range(6):
+            stream.feed(10400 + 40*i)
+        self.assertNotEqual(c.state, 1)
 
 if __name__ == '__main__':
     unittest.main()
